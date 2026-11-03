@@ -120,6 +120,34 @@ times (64 sessions) and 3,694 times (128 sessions).
 - **Most of the gain over kv_router comes from keeping each session on one cache.** Sticky round robin gets most of
   it. session_packing adds 0–2 steps (0–6%) on top in Mocker, against about 4.6 steps of total headroom to the floor.
 
+### 96 sessions / 4 caches (24 per cache, 5,371 req, 9 s stagger, 45 s solves)
+
+```bash
+.venv/bin/python -u session_packing.py --requests 0 --sessions 96 --caches 4 --time-limit 45   # ~8 min
+```
+
+Peak concurrent KV is 3.94 caches' worth out of 4, so memory nearly binds.
+
+- Budget 0 returned UNKNOWN in 45 s.
+- Budgets 1, 2 and 4 were FEASIBLE with a bound of 27.1. The best solution (31.0) uses **no** evictions, so 0
+  evictions is feasible but hard to find.
+- 128 sessions on 4 caches needs 5.35 caches' worth, so it is infeasible without far more eviction than the model
+  allows.
+
+| Mean TTFT (steps) | Soldr sim | Mocker |
+|---|---|---|
+| Uncontended lower bound | 27.1 | |
+| **session_packing** | 31.0 | **56.1** |
+| Sticky round robin | 31.8 | 57.9 |
+| Mocker kv_router | | 234.9 (moved sessions 2,165 times) |
+
+- At 24 sessions per cache, Mocker runs about 25 steps above the Soldr model for *both* routings, against 2–4 steps at
+  16 per cache.
+- Lost hits are a small part of that, measured on round robin. Mocker's LRU loses 2.2% of hit tokens, although 137 of
+  5,275 follow-up turns lose more than half their hit.
+- The rest is load the model doesn't charge for, probably decode interference (see TODO 3).
+- session_packing beats sticky round robin by only 1.8 steps (3%) in Mocker.
+
 ### Memory-bound case: 218 sessions / 8 caches (11,846 req)
 
 - **Budget 0 is provably infeasible.** Peak concurrent KV is 10.0 caches' worth against 8 caches.
