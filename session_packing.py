@@ -1,6 +1,5 @@
-import json
-import sys
-from dataclasses import dataclass
+import argparse
+from dataclasses import dataclass, replace
 from heapq import heappop, heappush
 from ortools.sat.python import cp_model
 from cache_packing import GapLogger, default_latency, from_weka, shared_tokens
@@ -72,16 +71,16 @@ def plan(trace, js, blk_size, prefill_latency, evict=None):
     return Plan(evict, prefills, ttfts, profile)
 
 
-# FIFO prefill delay one session's requests impose on another's if they share a cache
-def contention(pa, pb):
-    cost = 0
-    for sa, ea in pa.prefills:
-        for sb, eb in pb.prefills:
-            if sa <= sb < ea:
-                cost += ea - sb
-            elif sb < sa < eb:
-                cost += eb - sa
-    return cost
+# FIFO prefill delay each pair of sessions would impose on each other if they shared a cache
+def contention(plans):
+    costs, active = {}, []
+    for a, b, s in sorted((a, b, s) for s, p in enumerate(plans) for a, b in p.prefills):
+        active = [(e, t) for e, t in active if e > a]
+        for e, t in active:
+            if t != s:
+                costs[min(s, t), max(s, t)] = costs.get((min(s, t), max(s, t)), 0) + e - a
+        active.append((b, s))
+    return costs
 
 
 def build_model(trace, blk_size, num_caches, mem, prefill_latency, max_evictions=0, evict_candidates=3):
@@ -121,7 +120,7 @@ def build_model(trace, blk_size, num_caches, mem, prefill_latency, max_evictions
         model.AddCumulative(intervals, demands, mem)
 
     # same[a][b]: sessions a and b share a cache, which costs the pairwise contention estimate
-    costs = {(a, b): contention(plans[a][0], plans[b][0]) for a in range(S) for b in range(a + 1, S)}
+    costs = contention([p[0] for p in plans])
     same = {}
     for (a, b), cost in costs.items():
         if cost > 0:
@@ -209,28 +208,40 @@ def stats(ttfts):
 
 
 if __name__ == "__main__":
-    # Same instance as cache_packing.py
-    num_requests = 512
-    num_caches = 4
-    sessions = 16 * num_caches
-    stagger_s = 900 // sessions
-    mem = default_latency.kv_capacity // int(sys.argv[1]) if len(sys.argv) > 1 else default_latency.kv_capacity
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--caches", type=int, default=4)
+    ap.add_argument("--sessions", type=int, default=64)
+    ap.add_argument("--requests", type=int, default=512, help="0 for whole sessions")
+    ap.add_argument("--stagger", type=float, default=None, help="seconds between session starts, default 900 / sessions")
+    ap.add_argument("--mem-div", type=float, default=1, help="divide each cache's KV capacity by this")
+    ap.add_argument("--time-limit", type=float, default=60)
+    ap.add_argument("--kv-router-runs", type=int, default=1)
+    args = ap.parse_args()
 
-    trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=num_requests, stagger_s=stagger_s)
+    # Defaults are the same instance as cache_packing.py
+    num_caches = args.caches
+    stagger_s = 900 // args.sessions if args.stagger is None else args.stagger
+    mem = int(default_latency.kv_capacity / args.mem_div)
+    # Mocker gets the same capacity as the solver
+    latency = replace(default_latency, kv_capacity=mem)
+
+    trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=args.sessions, n=args.requests or None,
+                                stagger_s=stagger_s)
     print("Total requests: ", len(trace), "mem: ", mem)
 
-    # Outer loop over the eviction budget: double it until feasible, then one more to see if it helps
+    # Outer loop over the eviction budget: double it until feasible, then one more to see if it helps (unless memory
+    # never binds)
     best, first = None, None
     for max_evictions in [0, 1, 2, 4, 8, 16, 32, 64]:
-        model, vars = build_model(trace, blk_size, num_caches, mem, default_latency, max_evictions=max_evictions)
+        model, vars = build_model(trace, blk_size, num_caches, mem, latency, max_evictions=max_evictions)
         print(f"\nmax_evictions={max_evictions}: {len(vars['groups'])} sessions, {len(vars['same'])} contention pairs")
-        solver, status = solve(model, time_limit=60)
+        solver, status = solve(model, time_limit=args.time_limit)
         if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             print(f"Est. avg TTFT {solver.ObjectiveValue() / len(trace):.1f}, bound {solver.BestObjectiveBound() / len(trace):.1f}")
             first = max_evictions if first is None else first
             if best is None or solver.ObjectiveValue() < best[0]:
                 best = (solver.ObjectiveValue(), *extract(solver, vars))
-        if first is not None and max_evictions >= 2 * first + 1:
+        if first is not None and (first == 0 or max_evictions >= 2 * first + 1):
             break
 
     groups = vars["groups"]
@@ -238,14 +249,15 @@ if __name__ == "__main__":
     print("\nSessions per cache:", [route.count(c) for c in range(num_caches)])
     print("Evictions:", [(s, k) for s, k in enumerate(evicts) if k is not None])
 
-    dt = default_latency.decode_ms
+    dt = latency.decode_ms
     rr = [s % num_caches for s in range(len(groups))]
     print(f"\nTTFT in timesteps ({dt} ms)")
-    print(f"{'session_packing (Soldr sim)':32s}", stats(simulate(trace, groups, route, blk_size, default_latency)))
-    print(f"{'session_packing (Mocker)':32s}", stats(replay_routing(trace, groups, route, blk_size, default_latency)))
-    print(f"{'sticky round robin (Soldr sim)':32s}", stats(simulate(trace, groups, rr, blk_size, default_latency)))
-    print(f"{'sticky round robin (Mocker)':32s}", stats(replay_routing(trace, groups, rr, blk_size, default_latency)))
-    for run in range(3):
-        ttfts, workers = replay_kv_router(trace, num_caches, blk_size, default_latency)
+    print(f"{'uncontended lower bound':32s}", stats([t for p in vars["plans"] for t in p[0].ttfts]))
+    print(f"{'session_packing (Soldr sim)':32s}", stats(simulate(trace, groups, route, blk_size, latency)))
+    print(f"{'session_packing (Mocker)':32s}", stats(replay_routing(trace, groups, route, blk_size, latency)))
+    print(f"{'sticky round robin (Soldr sim)':32s}", stats(simulate(trace, groups, rr, blk_size, latency)))
+    print(f"{'sticky round robin (Mocker)':32s}", stats(replay_routing(trace, groups, rr, blk_size, latency)))
+    for run in range(args.kv_router_runs):
+        ttfts, workers = replay_kv_router(trace, num_caches, blk_size, latency)
         moved = sum(trace[j].prev is not None and workers[j] != workers[trace[j].prev] for j in range(len(trace)))
         print(f"{f'Mocker kv_router run {run}':32s}", stats(ttfts), f"(session switched worker {moved} times)")

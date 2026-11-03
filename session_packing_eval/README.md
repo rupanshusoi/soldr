@@ -35,12 +35,22 @@ cache serves each session, plus an optional single eviction per session. The mod
 ## How to run (from the repo root, with `.venv/bin/python`)
 
 ```bash
-.venv/bin/python -u session_packing.py            # same instance as cache_packing.py: 4 caches, 64 sessions, 512 req, 14 s stagger
+.venv/bin/python -u session_packing.py                                        # same instance as cache_packing.py: 4 caches, 64 sessions, 512 req, 14 s stagger
 ```
 
 ```bash
-.venv/bin/python -u session_packing.py 4          # stress test: per-cache KV capacity divided by 4
+.venv/bin/python -u session_packing.py --mem-div 4                            # stress test: per-cache KV capacity divided by 4 (solver and Mocker)
 ```
+
+```bash
+.venv/bin/python -u session_packing.py --requests 0                           # all 64 sessions in full (3,433 requests), ~4 min
+```
+
+```bash
+.venv/bin/python -u session_packing.py --requests 0 --sessions 128 --caches 8 # 7,018 requests, ~4 min
+```
+
+Other flags are `--stagger` (in seconds), `--time-limit` (per eviction budget, default 60 s) and `--kv-router-runs`.
 
 ```bash
 .venv/bin/python -u session_packing_eval/cp_replay.py   # replays cache_packing's P90-optimal schedule in Mocker (needs local untracked schedule_4c_64s_512r_14st_qwen3.json)
@@ -81,6 +91,50 @@ has not been rerun to completion.
   - 4 × 389k = 1.56M, so this level needs real eviction.
   - One eviction per session, limited to the top-3 think gaps, frees only one gap's hold. That seems too weak.
 
+### Full sessions, mean TTFT (prelim, 60 s solves)
+
+The "Mocker alone" row is Mocker's own no-contention floor: every session is replayed by itself on its own worker.
+
+| | 64 sessions / 4 caches (3,433 req) | 128 sessions / 8 caches (7,018 req) |
+|---|---|---|
+| Peak concurrent KV, in caches' worth | 2.68 of 4 | 5.35 of 8 |
+| Soldr uncontended lower bound | 25.5 | 26.8 |
+| Mocker alone (no contention) | – | **25.8** |
+| session_packing, Soldr sim | 25.8 | 26.9 |
+| **session_packing, Mocker** | **28.6** | **29.4–30.5** (two solves) |
+| Sticky round robin, Mocker | 30.4 | 30.4 |
+| Mocker kv_router | 134.0 | 208.0 |
+
+Both solves ended FEASIBLE, with the model's gap under 0.5%. kv_router moved a session off its previous worker 1,250
+times (64 sessions) and 3,694 times (128 sessions).
+
+- **The model misses most of the real contention at scale.** With 128 sessions on 8 caches, the Soldr model puts
+  session_packing at the floor (26.9) and round robin 2.4 steps above it.
+  - In Mocker, both routings sit about 4 steps above Mocker's own floor (25.8).
+  - The floor is below the Soldr bound, so the calibration is not biased upward and the excess is contention.
+  - Per cache, the Mocker excess is +2–4 steps and fairly uniform. It does not track lost cache hits, which are
+    small and occur under both routings.
+  - Likely cause: decode interference. vLLM mixes prefill chunks with decode tokens in an 8,192-token budget, and the
+    model only charges FIFO overlap between prefills. The two near-optimal solves differed by 1 step in Mocker, which
+    is also the noise level of the comparison.
+- **Most of the gain over kv_router comes from keeping each session on one cache.** Sticky round robin gets most of
+  it. session_packing adds 0–2 steps (0–6%) on top in Mocker, against about 4.6 steps of total headroom to the floor.
+
+### Memory-bound case: 218 sessions / 8 caches (11,846 req)
+
+- **Budget 0 is provably infeasible.** Peak concurrent KV is 10.0 caches' worth against 8 caches.
+- CP-SAT returned UNKNOWN in 30 s. The run was stopped during budget 1, because the remaining budgets would take about
+  15 min and likely also end UNKNOWN.
+- **The eviction model can't express this regime.** At most one eviction per session, in one of its top-3 think gaps,
+  cannot free 2 caches' worth at a single peak instant. Memory-bound operation needs most sessions evicted during most
+  of their long gaps.
+- **Suggested fix:** replace "evict at gap g" with per-session **TTL options**. Evict during every think gap longer
+  than τ, with τ from a small set such as {∞, 120 s, 60 s, 30 s, 10 s}. This still uses only per-session option
+  variables.
+  - It is a real policy, which makes it easy to replay.
+  - The budget becomes the total number of re-prefills, or the objective just charges them.
+  - CP-SAT will also need a greedy hint to find any feasible solution at this size.
+
 ## Patterns observed
 
 - **This instance is not memory-bound.** Peak concurrent KV across *all* 41 sessions is 2.19M, which is less than
@@ -106,21 +160,23 @@ has not been rerun to completion.
 
 ## TODO, in priority order
 
-1. **Mocker capacity in stress mode.** `replay_routing` and `replay_kv_router` build Mocker from `default_latency`, so
-   they always use the full `kv_capacity` even when `mem` is reduced. Pass `dataclasses.replace(p, kv_capacity=mem)`,
-   then rerun `session_packing.py 4`.
-2. **Finish the cache_packing mean-objective comparison** (`cp_mean.py`). Report its Soldr and Mocker mean TTFT next to
-   session_packing's 37.4.
-3. **Scale.** Real capacity makes the 512-request instance trivial. Try the full sessions:
+1. ~~Mocker capacity in stress mode~~ Done: `--mem-div` now applies to Mocker too. The table above has not been rerun
+   since this fix.
+2. **Finish the cache_packing mean-objective comparison** (`cp_mean.py`) on the 512-request instance only.
+   cache_packing can't build the full-session instances (O(N²)).
+3. **Contention model:** add decode-load interference to the pairwise cost, then check whether Mocker's ~4-step excess
+   over the floor drops.
+4. **TTL eviction options** for the 218-session memory-bound case (see above).
+5. ~~Scale~~ Partly done (see above). Earlier notes: Real capacity makes the 512-request instance trivial. Try the full sessions:
    - Use `from_weka(..., sessions=64, n=None)`, which is 3,433 requests.
    - Try 128 sessions on 8 caches (7,018 requests).
    - Only 218 subagent-free sessions exist, so `sessions` must be ≤ 218.
    - Time the model build: `contention()` is O(n_a·n_b) Python per session pair and may need a sorted sweep.
    - Also try lower capacity or a shorter stagger so memory binds.
-4. **Eviction model at mem/6.**
+6. **Eviction model at mem/6** (superseded by TTL options).
    - Allow all gaps (`evict_candidates=None` → all).
    - Allow more than one eviction per session.
    - Allow partial eviction that keeps the prefix the next request needs.
    - Check whether mem/6 becomes feasible, and at what budget.
-5. Report everything in the results table format above: mean, p50, p90 and p99 in timesteps, for Soldr sim, Mocker
+7. Report everything in the results table format above: mean, p50, p90 and p99 in timesteps, for Soldr sim, Mocker
    replay, sticky round robin and kv_router.
