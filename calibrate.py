@@ -51,6 +51,7 @@ class MockerLatency:
 
 def run_mocker(rows, workers, block_size, p):
     os.environ.setdefault("DYN_LOG", "warn")
+    from dynamo.llm import KvRouterConfig
     from dynamo.replay import run_trace_replay
 
     # Rows with dependencies are sessions, replayed closed-loop in Mocker's agentic format
@@ -65,6 +66,7 @@ def run_mocker(rows, workers, block_size, p):
         # No agentic_lanes: with lanes, Mocker measures not_before_ms from each session's start, which drops our offsets
         extra = dict(trace_format="agentic_mooncake", execution_model=p.aic["model"]) if agentic else {}
         report = run_trace_replay(path, extra_engine_args=mocker_engine(p), num_workers=workers, router_mode="kv_router",
+                                  router_config=KvRouterConfig(router_track_active_blocks=False),
                                   trace_block_size=block_size, capture_per_request=True, **extra)
     if agentic:
         recs = {q["request_id"]: q for q in report.to_dict()["per_request"]}
