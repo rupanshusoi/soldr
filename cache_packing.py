@@ -3,7 +3,7 @@ from dataclasses import dataclass, replace
 from itertools import islice
 from math import ceil
 from ortools.sat.python import cp_model
-from calibrate import MockerLatency, compare
+from calibrate import MockerLatency, compare, compute_usage, mocker_recs, peak_working_set
 
 @dataclass
 class Request:
@@ -250,15 +250,18 @@ if __name__ == "__main__":
     # num_requests = 128
     # trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
 
-    num_requests = 512
+    num_requests = 128
     num_caches = 4
-    sessions = 16 * num_caches
+    sessions = 48 * num_caches
     # 900 s is the average session length for Weka
     stagger_s = 900 // sessions
-    objective = 0.90
+    objective = "mean"
 
     trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=num_requests, stagger_s=stagger_s)
     print("Total requests: ", len(trace))
+    recs = mocker_recs(trace, blk_size, num_caches, default_latency)
+    peak_working_set(trace, recs, num_caches, default_latency)
+    compute_usage(recs, num_caches)
     model, vars = build_model(trace, blk_size, num_caches=num_caches, mem=default_latency.kv_capacity, horizon=10_000_000,
                               prefill_latency=default_latency, objective=objective)
     print("Built model, beginning solve...")

@@ -6,6 +6,9 @@ from dataclasses import asdict, dataclass, replace
 from math import ceil
 import numpy as np
 
+# Must be set before dynamo is first imported
+os.environ.setdefault("DYN_LOG", "warn")
+
 
 def mocker_engine(p):
     return {
@@ -49,8 +52,7 @@ class MockerLatency:
         return max(1, round(self.prefill_ms(isl, hit) / self.decode_ms))
 
 
-def run_mocker(rows, workers, block_size, p):
-    os.environ.setdefault("DYN_LOG", "warn")
+def replay(rows, workers, block_size, p, **kwargs):
     from dynamo.replay import run_trace_replay
 
     # Rows with dependencies are sessions, replayed closed-loop in Mocker's agentic format
@@ -64,8 +66,13 @@ def run_mocker(rows, workers, block_size, p):
             f.writelines(json.dumps(r) + "\n" for r in rows)
         # No agentic_lanes: with lanes, Mocker measures not_before_ms from each session's start, which drops our offsets
         extra = dict(trace_format="agentic_mooncake", execution_model=p.aic["model"]) if agentic else {}
-        report = run_trace_replay(path, extra_engine_args=mocker_engine(p), num_workers=workers, router_mode="kv_router",
-                                  trace_block_size=block_size, capture_per_request=True, **extra)
+        return run_trace_replay(path, extra_engine_args=mocker_engine(p), num_workers=workers, router_mode="kv_router",
+                                trace_block_size=block_size, capture_per_request=True, **extra, **kwargs)
+
+
+def run_mocker(rows, workers, block_size, p):
+    agentic = "dependencies" in rows[0]
+    report = replay(rows, workers, block_size, p)
     if agentic:
         recs = {q["request_id"]: q for q in report.to_dict()["per_request"]}
         return [recs[r["request_id"]] for r in rows]
@@ -97,10 +104,28 @@ def soldr_ttft(rows, recs, prefill_latency, objective="mean"):
     return summarize(ttfts, objective)
 
 
-def compare(trace, blk_size, solver, vars, prefill_latency, objective="mean", mocker_runs=3):
+def mocker_rows(trace, prefill_latency, sessions=True):
     dt = prefill_latency.decode_ms
     rows = [{"timestamp": (u.arrival or 0) * dt, "input_length": u.isl, "output_length": u.osl, "hash_ids": u.hash_ids}
             for u in trace]
+    if not sessions or all(u.prev is None for u in trace):
+        return rows
+
+    session = []
+    for j, u in enumerate(trace):
+        session.append(j if u.prev is None else session[u.prev])
+    deps = lambda u: [] if u.prev is None else [dict(request_id=str(u.prev), trigger="completion",
+                                                     delay_ms=u.think * dt, relation="sequence")]
+    return [r | dict(request_id=str(j), play_id=str(session[j]), session_id=str(session[j]),
+                     # First turns are released at their arrival, later turns by their dependency only
+                     model=prefill_latency.aic["model"], not_before_ms=float(r["timestamp"]),
+                     dependencies=deps(u))
+            for j, (r, u) in enumerate(zip(rows, trace))]
+
+
+def compare(trace, blk_size, solver, vars, prefill_latency, objective="mean", mocker_runs=3):
+    dt = prefill_latency.decode_ms
+    rows = mocker_rows(trace, prefill_latency, sessions=False)
     route = [next(c for c, r in enumerate(rs) if solver.Value(r)) for rs in vars["routes"]]
     submit = [solver.Value(s) * dt for s in vars["starts"]]
     release = [solver.Value(r) * dt for r in vars["releases"]]
@@ -110,17 +135,7 @@ def compare(trace, blk_size, solver, vars, prefill_latency, objective="mean", mo
         for j, q in zip(ix, run_mocker([rows[j] | {"timestamp": submit[j]} for j in ix], 1, blk_size, prefill_latency)):
             soldr_mocker[j] = submit[j] - release[j] + q["ttft_ms"]
 
-    if any(u.prev is not None for u in trace):
-        session = []
-        for j, u in enumerate(trace):
-            session.append(j if u.prev is None else session[u.prev])
-        deps = lambda u: [] if u.prev is None else [dict(request_id=str(u.prev), trigger="completion",
-                                                         delay_ms=u.think * dt, relation="sequence")]
-        rows = [r | dict(request_id=str(j), play_id=str(session[j]), session_id=str(session[j]),
-                         # First turns are released at their arrival, later turns by their dependency only
-                         model=prefill_latency.aic["model"], not_before_ms=float(r["timestamp"]),
-                         dependencies=deps(u))
-                for j, (r, u) in enumerate(zip(rows, trace))]
+    rows = mocker_rows(trace, prefill_latency)
 
     score = lambda recs: (soldr_ttft(rows, recs, prefill_latency, objective),
                           summarize([q["ttft_ms"] / dt for q in recs], objective))
@@ -132,6 +147,51 @@ def compare(trace, blk_size, solver, vars, prefill_latency, objective="mean", mo
     print(f"{label:18s} {'Soldr':>7s} {'Mocker':>7s}")
     for name, soldr, mock in table:
         print(f"{name:18s} {soldr:7.1f} {mock:7.1f}")
+
+
+# Mocker's per-request records for the trace, under its own kv_router decisions
+def mocker_recs(trace, blk_size, num_caches, prefill_latency):
+    return run_mocker(mocker_rows(trace, prefill_latency), num_caches, blk_size, prefill_latency)
+
+
+def peak_working_set(trace, recs, num_caches, prefill_latency):
+    last = {}
+    for j, u in enumerate(trace):
+        if u.prev is not None:
+            last.pop(u.prev)
+        last[j] = True
+
+    events = []
+    for j, (u, q) in enumerate(zip(trace, recs)):
+        held = 0 if u.prev is None else trace[u.prev].isl + trace[u.prev].osl
+        events.append((q["arrival_time_ms"], u.isl + u.osl - held))
+        if j in last:
+            events.append((q["terminal_time_ms"], -(u.isl + u.osl)))
+
+    live = peak = 0
+    for _, delta in sorted(events):
+        live += delta
+        peak = max(peak, live)
+    peak /= num_caches * prefill_latency.kv_capacity
+    print(f"Peak working set: {peak:.1%} of mem")
+    return peak
+
+
+def covered(intervals):
+    total, end = 0, float("-inf")
+    for a, b in sorted(intervals):
+        total += max(0, b - max(a, end))
+        end = max(end, b)
+    return total
+
+
+def compute_usage(recs, num_caches):
+    duration = max(q["terminal_time_ms"] for q in recs) - min(q["arrival_time_ms"] for q in recs)
+    on = lambda c, end: covered((q["first_admit_ms"], q[end]) for q in recs if q["decode_worker_idx"] == c)
+    busy = sum(on(c, "terminal_time_ms") for c in range(num_caches)) / (num_caches * duration)
+    prefill = sum(on(c, "first_token_ms") for c in range(num_caches)) / (num_caches * duration)
+    print(f"Avg compute usage: {busy:.1%} ({prefill:.1%} prefill, {busy - prefill:.1%} decode only)")
+    return busy, prefill
 
 
 def calibrate_ab(p):
