@@ -3,7 +3,7 @@ from dataclasses import dataclass, replace
 from itertools import islice
 from math import ceil
 from ortools.sat.python import cp_model
-from calibrate import MockerLatency, compare, compute_usage, mocker_recs, peak_working_set
+from calibrate import MockerLatency, compare, compute_usage, mocker_recs, peak_working_set, shared_tokens, swimlane
 
 @dataclass
 class Request:
@@ -61,19 +61,10 @@ def from_weka(path, sessions, n=None, stagger_s=0, ms_per_step=default_latency.d
     trace = [replace(trace[i], prev=None if trace[i].prev is None else pos[trace[i].prev]) for i in order]
     return trace, blk_sizes.pop()
 
-def shared_tokens(u, v, blk_size):
-    count = 0
-    for b1, b2 in zip(u.hash_ids, v.hash_ids):
-        if b1 != b2:
-            break
-        count += 1
-    return min(count * blk_size, u.isl, v.isl)
-
 # Reduction in prefill time of v if it gets a cache hit from u
 def saving(u, v, blk_size, prefill_latency=default_latency):
     return prefill_latency(v.isl) - prefill_latency(v.isl, shared_tokens(u, v, blk_size))
 
-# objective is "mean" (sum of TTFTs) or a quantile in (0, 1), e.g. 0.9 for p90 TTFT
 def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, objective="mean"):
     N, C = len(trace), num_caches
     assert mem >= max([u.isl + u.osl for u in trace])
@@ -254,11 +245,16 @@ if __name__ == "__main__":
     num_caches = 4
     sessions = 48 * num_caches
     # 900 s is the average session length for Weka
-    stagger_s = 0 # 900 // sessions
+    stagger_s = 900 // sessions
     objective = "mean"
 
     trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=num_requests, stagger_s=stagger_s)
     print("Total requests: ", len(trace))
+    # Sessions that survived the truncation due to num_requests
+    total_sessions = sum(u.prev is None for u in trace)
+    print("Total sessions: ", total_sessions)
+    print(f"Avg session length: {len(trace) / total_sessions:.1f} requests")
+    print(f"Session stagger: {stagger_s} s")
     recs = mocker_recs(trace, blk_size, num_caches, default_latency)
     peak_working_set(trace, recs, num_caches, default_latency)
     compute_usage(recs, num_caches)
@@ -267,6 +263,7 @@ if __name__ == "__main__":
     print("Built model, beginning solve...")
     solver, status = solve(model, vars, objective)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        compare(trace, blk_size, solver, vars, default_latency, objective)
-        dump_schedule(f"{num_caches}c_{sessions}s_{len(trace)}r_{stagger_s}st_{default_latency.config.split('-')[0]}",
-                      trace, blk_size, solver, status, vars, default_latency)
+        config = f"{num_caches}c_{sessions}s_{len(trace)}r_{stagger_s}st_{default_latency.config.split('-')[0]}"
+        schedules = compare(trace, blk_size, solver, vars, default_latency, objective)
+        swimlane(trace, blk_size, schedules, f"swimlane_{config}.png", default_latency)
+        dump_schedule(config, trace, blk_size, solver, status, vars, default_latency)

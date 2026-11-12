@@ -19,4 +19,5 @@ ortools==9.15.6755
 protobuf==6.33.6
 grpcio-tools==1.81.1
 numpy
+matplotlib
 pytest

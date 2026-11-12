@@ -130,28 +130,116 @@ def compare(trace, blk_size, solver, vars, prefill_latency, objective="mean", mo
     submit = [solver.Value(s) * dt for s in vars["starts"]]
     release = [solver.Value(r) * dt for r in vars["releases"]]
     soldr_mocker = [0.0] * len(rows)
+    # Soldr's schedule as Mocker replays it. Mocker's clock starts at each worker's first submission.
+    schedules = {"Soldr": [None] * len(rows)}
     for c in set(route):
         ix = sorted((j for j in range(len(rows)) if route[j] == c), key=lambda j: (submit[j], j))
         for j, q in zip(ix, run_mocker([rows[j] | {"timestamp": submit[j]} for j in ix], 1, blk_size, prefill_latency)):
             soldr_mocker[j] = submit[j] - release[j] + q["ttft_ms"]
+            t0 = submit[j] - q["arrival_time_ms"]
+            schedules["Soldr"][j] = dict(worker=c, release=release[j], start=t0 + q["first_admit_ms"],
+                                         prefill_end=t0 + q["first_token_ms"], end=t0 + q["terminal_time_ms"],
+                                         reused=q["reused_input_tokens"])
 
     rows = mocker_rows(trace, prefill_latency)
 
     score = lambda recs: (soldr_ttft(rows, recs, prefill_latency, objective),
                           summarize([q["ttft_ms"] / dt for q in recs], objective))
     from dynamo._core import KvRouterConfig
-    # Mean (Soldr model, Mocker) score over mocker_runs replays
-    def mocker(**kwargs):
-        runs = [score(run_mocker(rows, len(vars["routes"][0]), blk_size, prefill_latency, **kwargs)) for _ in range(mocker_runs)]
-        return sum(s for s, _ in runs) / mocker_runs, sum(m for _, m in runs) / mocker_runs
+    # Mean (Soldr model, Mocker) score over mocker_runs replays. The first replay is kept as the schedule to plot.
+    def mocker(name, **kwargs):
+        runs = [run_mocker(rows, len(vars["routes"][0]), blk_size, prefill_latency, **kwargs) for _ in range(mocker_runs)]
+        schedules[name] = [dict(worker=q["decode_worker_idx"], release=q["arrival_time_ms"], start=q["first_admit_ms"],
+                                prefill_end=q["first_token_ms"], end=q["terminal_time_ms"],
+                                reused=q["reused_input_tokens"]) for q in runs[0]]
+        runs = [score(recs) for recs in runs]
+        return name, sum(s for s, _ in runs) / mocker_runs, sum(m for _, m in runs) / mocker_runs
     soldr_soldr = summarize([solver.Value(t) for t in vars["ttfts"]], objective)
     table = [("Soldr", soldr_soldr, summarize([t / dt for t in soldr_mocker], objective)),
-             ("Mocker", *mocker()),
-             ("Mocker (w/o active tracking)", *mocker(router_config=KvRouterConfig(router_track_active_blocks=False)))]
+             mocker("Mocker"),
+             mocker("Mocker (w/o active tracking)", router_config=KvRouterConfig(router_track_active_blocks=False))]
     label = "Avg TTFT" if objective == "mean" else f"P{objective * 100:g} TTFT"
     print(f"{label:28s} {'Soldr':>7s} {'Mocker':>7s}")
     for name, soldr, mock in table:
         print(f"{name:28s} {soldr:7.1f} {mock:7.1f}")
+    return schedules
+
+
+def shared_tokens(u, v, blk_size):
+    count = 0
+    for b1, b2 in zip(u.hash_ids, v.hash_ids):
+        if b1 != b2:
+            break
+        count += 1
+    return min(count * blk_size, u.isl, v.isl)
+
+
+def swimlane(trace, blk_size, schedules, path, prefill_latency, dpi=300):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    session = []
+    for j, u in enumerate(trace):
+        session.append(j if u.prev is None else session[u.prev])
+    # Lanes in order of first appearance in the trace, which is by estimated release
+    lane = {s: k for k, s in enumerate(dict.fromkeys(session))}
+    y = [lane[s] for s in session]
+    earlier = [[i for i in range(j) if session[i] == session[j]] for j in range(len(trace))]
+    shared = [{i: shared_tokens(trace[i], v, blk_size) for i in earlier[j]} for j, v in enumerate(trace)]
+    achievable = [max(s.values(), default=0) for s in shared]
+
+    workers = 1 + max(q["worker"] for recs in schedules.values() for q in recs)
+    colors = plt.get_cmap("tab10" if workers <= 10 else "tab20").colors
+    plt.style.use("dark_background")
+    fig, axes = plt.subplots(len(schedules), 1, sharex=True, sharey=True, squeeze=False,
+                             figsize=(16, len(schedules) * max(3, 0.6 + 0.14 * len(lane))))
+    for ax, (name, recs) in zip(axes[:, 0], schedules.items()):
+        sec = lambda key: [q[key] / 1000 for q in recs]
+        release, start, prefill_end, end = sec("release"), sec("start"), sec("prefill_end"), sec("end")
+        color = [colors[q["worker"] % len(colors)] for q in recs]
+        width = lambda a, b: [t1 - t0 for t0, t1 in zip(a, b)]
+        ax.barh(y, width(release, start), left=release, height=0.25, color="0.6", zorder=1)
+        ax.barh(y, width(prefill_end, end), left=prefill_end, height=0.8, color=color, alpha=0.35, lw=0, zorder=2)
+        ax.barh(y, width(start, prefill_end), left=start, height=0.8, color=color, lw=0, zorder=3)
+
+        miss = {"routing": [], "eviction": []}
+        switches = 0
+        for j, q in enumerate(recs):
+            switches += trace[j].prev is not None and recs[trace[j].prev]["worker"] != q["worker"]
+            if achievable[j] - q["reused"] > blk_size:
+                local = any(shared[j][i] == achievable[j] and recs[i]["worker"] == q["worker"] for i in earlier[j])
+                miss["eviction" if local else "routing"].append(j)
+        ax.scatter([start[j] for j in miss["routing"]], [y[j] for j in miss["routing"]], marker="x", s=30, lw=1.2,
+                   color="#ff4d4d", zorder=4)
+        ax.scatter([start[j] for j in miss["eviction"]], [y[j] for j in miss["eviction"]], marker="o", s=30, lw=1.2,
+                   facecolors="none", edgecolors="white", zorder=4)
+        reuse = sum(q["reused"] for q in recs) / max(1, sum(achievable))
+        ttft = sum(width(release, prefill_end)) * 1000 / prefill_latency.decode_ms / len(recs)
+        title = ax.set_title(name, fontsize=10, fontweight="bold", loc="left")
+        ax.annotate(f"mean TTFT {ttft:.1f} steps, {reuse:.0%} of achievable reuse, {len(miss['routing'])} routing misses, "
+                    f"{len(miss['eviction'])} eviction misses, {switches} worker switches", xy=(1, 0), xycoords=title,
+                    xytext=(8, 0), textcoords="offset points", va="bottom", fontsize=10)
+        ax.set_ylabel("session (by first request)")
+        ax.grid(axis="x", color="0.25", lw=0.5, zorder=0)
+        ax.set_axisbelow(True)
+    ax.set_ylim(len(lane) - 0.4, -0.6)
+    # Lanes are numbered from 0, so no ticks in the padding above the first lane
+    step = max(1, ceil(len(lane) / 20))
+    ax.set_yticks(range(0, len(lane), step))
+    ax.set_xlabel("time (s)")
+    handles = [Patch(color=colors[w % len(colors)], label=f"worker {w}") for w in range(workers)] + [
+        Patch(color="0.8", label="prefill"), Patch(color="0.8", alpha=0.35, lw=0, label="decode"),
+        Line2D([], [], color="0.6", lw=3, label="waiting to start"),
+        Line2D([], [], color="#ff4d4d", marker="x", ls="", label="routing miss"),
+        Line2D([], [], markerfacecolor="none", markeredgecolor="white", marker="o", ls="", label="eviction miss")]
+    fig.legend(handles=handles, loc="upper center", ncol=len(handles), fontsize=8, frameon=False)
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.3 / fig.get_figheight()))
+    fig.savefig(path, dpi=dpi)
+    plt.close(fig)
+    print("Wrote", path)
 
 
 # Mocker's per-request records for the trace, under its own kv_router decisions
