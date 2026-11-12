@@ -70,9 +70,9 @@ def replay(rows, workers, block_size, p, **kwargs):
                                 trace_block_size=block_size, capture_per_request=True, **extra, **kwargs)
 
 
-def run_mocker(rows, workers, block_size, p):
+def run_mocker(rows, workers, block_size, p, **kwargs):
     agentic = "dependencies" in rows[0]
-    report = replay(rows, workers, block_size, p)
+    report = replay(rows, workers, block_size, p, **kwargs)
     if agentic:
         recs = {q["request_id"]: q for q in report.to_dict()["per_request"]}
         return [recs[r["request_id"]] for r in rows]
@@ -139,14 +139,19 @@ def compare(trace, blk_size, solver, vars, prefill_latency, objective="mean", mo
 
     score = lambda recs: (soldr_ttft(rows, recs, prefill_latency, objective),
                           summarize([q["ttft_ms"] / dt for q in recs], objective))
-    mocker = [score(run_mocker(rows, len(vars["routes"][0]), blk_size, prefill_latency)) for _ in range(mocker_runs)]
+    from dynamo._core import KvRouterConfig
+    # Mean (Soldr model, Mocker) score over mocker_runs replays
+    def mocker(**kwargs):
+        runs = [score(run_mocker(rows, len(vars["routes"][0]), blk_size, prefill_latency, **kwargs)) for _ in range(mocker_runs)]
+        return sum(s for s, _ in runs) / mocker_runs, sum(m for _, m in runs) / mocker_runs
     soldr_soldr = summarize([solver.Value(t) for t in vars["ttfts"]], objective)
-    table = [("Soldr decisions", soldr_soldr, summarize([t / dt for t in soldr_mocker], objective)),
-             ("Mocker decisions", sum(s for s, _ in mocker) / mocker_runs, sum(m for _, m in mocker) / mocker_runs)]
+    table = [("Soldr", soldr_soldr, summarize([t / dt for t in soldr_mocker], objective)),
+             ("Mocker", *mocker()),
+             ("Mocker (w/o active tracking)", *mocker(router_config=KvRouterConfig(router_track_active_blocks=False)))]
     label = "Avg TTFT" if objective == "mean" else f"P{objective * 100:g} TTFT"
-    print(f"{label:18s} {'Soldr':>7s} {'Mocker':>7s}")
+    print(f"{label:28s} {'Soldr':>7s} {'Mocker':>7s}")
     for name, soldr, mock in table:
-        print(f"{name:18s} {soldr:7.1f} {mock:7.1f}")
+        print(f"{name:28s} {soldr:7.1f} {mock:7.1f}")
 
 
 # Mocker's per-request records for the trace, under its own kv_router decisions

@@ -14,7 +14,7 @@ class Request:
     prev: int | None = None
     think: int = 0
 
-default_latency = MockerLatency.load("qwen3-30b-a3b_h100x4")
+default_latency = MockerLatency.load("llama3.1-405b_h200x8")
 
 def from_mooncake(path, n=None, ms_per_step=default_latency.decode_ms):
     with open(path) as f:
@@ -254,7 +254,7 @@ if __name__ == "__main__":
     num_caches = 4
     sessions = 48 * num_caches
     # 900 s is the average session length for Weka
-    stagger_s = 900 // sessions
+    stagger_s = 0 # 900 // sessions
     objective = "mean"
 
     trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=num_requests, stagger_s=stagger_s)
