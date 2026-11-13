@@ -1,28 +1,13 @@
 import json
-from dataclasses import dataclass, replace
-from itertools import islice
+from dataclasses import dataclass
 from math import ceil
-from typing import Literal, TypedDict
+from typing import Any, TypedDict
 from ortools.sat.python import cp_model
-from calibrate import (MockerLatency, cache_lanes, compare, compute_usage, mocker_recs, peak_working_set, shared_tokens,
-                       swimlane)
+from mocker import Mocker, MockerLatency, MockerUsage, Objective, soldr_ttft, summarize
+from plot import Plotter, Schedules
+from workload import Loader, Request, Trace, shared_tokens
 
-Objective = Literal["mean"] | float
 Expr = cp_model.LinearExpr | int
-
-@dataclass
-class Request:
-    isl: int
-    osl: int
-    arrival: int | None
-    hash_ids: list[int]
-    prev: int | None = None
-    think: int = 0
-
-@dataclass
-class Trace:
-    requests: list[Request]
-    blk_size: int
 
 @dataclass
 class Config:
@@ -55,60 +40,6 @@ class Vars(TypedDict):
     ttfts: list[cp_model.IntVar]
     quantile: cp_model.IntVar | None
 
-@dataclass
-class Loader:
-    ms_per_step: int
-
-    def mooncake(self, path: str, n: int | None = None) -> Trace:
-        with open(path) as f:
-            rows = [json.loads(line) for line in islice(f, n)]
-        t0 = rows[0]["timestamp"]
-        step = self.ms_per_step
-        trace = [Request(r["input_length"], r["output_length"], (r["timestamp"] - t0) // step, r["hash_ids"])
-                 for r in rows]
-        return Trace(trace, 512)
-
-    # Arrival timestamps for Weka are ignored, we use only think_time. Session starts are staggered.
-    def weka(self, path: str, sessions: int, n: int | None = None, stagger_s: float = 0,
-             idle_cap_s: float = 300) -> Trace:
-        chosen = []
-        with open(path) as f:
-            for line in f:
-                session = json.loads(line)
-                # Ignore sessions with subagents
-                if all(r["type"] != "subagent" for r in session["requests"]):
-                    chosen.append(session)
-                if len(chosen) == sessions:
-                    break
-        assert len(chosen) == sessions, f"only {len(chosen)} sessions without subagents"
-        blk_sizes = {p["block_size"] for p in chosen}
-        assert len(blk_sizes) == 1
-
-        # est is a release time estimate using the recorded API times, used to pick the first n requests
-        trace: list[Request] = []
-        est: list[float] = []
-        offset = 0
-        for s, session in enumerate(chosen):
-            t = s * stagger_s
-            for k, r in enumerate(session["requests"]):
-                # Cap think time. This appears to be a standard transformation for
-                # Weka and helps decrease the horizon for us.
-                think = 0 if k == 0 else min(r["think_time"], idle_cap_s)
-                t += think
-                est.append(t)
-                arrival = round(s * stagger_s * 1000) // self.ms_per_step if k == 0 else None
-                prev = None if k == 0 else len(trace) - 1
-                trace.append(Request(r["in"], max(1, r["out"]), arrival, [h + offset for h in r["hash_ids"]], prev,
-                                     round(think * 1000) // self.ms_per_step))
-                t += r["api_time"]
-            offset += 1 + max(h for r in session["requests"] for h in r["hash_ids"])
-
-        assert n is None or len(trace) >= n
-        order = sorted(range(len(trace)), key=lambda i: est[i])[:n]
-        pos = {i: k for k, i in enumerate(order)}
-        prev_of = lambda u: None if u.prev is None else pos[u.prev]
-        return Trace([replace(trace[i], prev=prev_of(trace[i])) for i in order], blk_sizes.pop())
-
 # Reduction in prefill time of v if it gets a cache hit from u
 def saving(u: Request, v: Request, blk_size: int, prefill_latency: MockerLatency) -> int:
     return prefill_latency(v.isl) - prefill_latency(v.isl, shared_tokens(u, v, blk_size))
@@ -139,6 +70,7 @@ class Soldr:
         # self.trace = loader.mooncake("traces/mooncake_conversation.jsonl", n=128)
         self.trace = loader.weka(cfg.trace, sessions=cfg.sessions, n=cfg.num_requests, stagger_s=cfg.stagger_s)
         self.name = cfg.name(self.trace)
+        self.mocker = Mocker(self.latency, self.trace.blk_size)
 
     def log_stats(self) -> None:
         cfg, reqs = self.cfg, self.trace.requests
@@ -148,9 +80,9 @@ class Soldr:
         print("Total sessions: ", total_sessions)
         print(f"Avg session length: {len(reqs) / total_sessions:.1f} requests")
         print(f"Session stagger: {cfg.stagger_s} s")
-        recs = mocker_recs(reqs, self.trace.blk_size, cfg.num_caches, self.latency)
-        peak_working_set(reqs, recs, cfg.num_caches, self.latency)
-        compute_usage(recs, cfg.num_caches)
+        usage = MockerUsage(self.trace, cfg.num_caches, self.latency)
+        usage.peak_working_set()
+        usage.compute_usage()
 
     def build_model(self) -> tuple[cp_model.CpModel, Vars]:
         reqs, blk_size, prefill_latency = self.trace.requests, self.trace.blk_size, self.latency
@@ -281,13 +213,53 @@ class Soldr:
         return sol
 
     # Replays Soldr's schedule and Dynamo's own in the Mocker
-    def compare(self, sol: Solution) -> dict[str, list[dict]]:
-        return compare(self.trace.requests, self.trace.blk_size, sol.solver, sol.vars, self.latency, self.cfg.objective)
+    def compare(self, sol: Solution, mocker_runs: int = 3) -> Schedules:
+        solver, vars, mocker, objective = sol.solver, sol.vars, self.mocker, self.cfg.objective
+        reqs, dt = self.trace.requests, self.latency.decode_ms
+        rows = mocker.rows(reqs, sessions=False)
+        route = [next(c for c, r in enumerate(rs) if solver.Value(r)) for rs in vars["routes"]]
+        submit = [solver.Value(s) * dt for s in vars["starts"]]
+        release = [solver.Value(r) * dt for r in vars["releases"]]
+        soldr_mocker = [0.0] * len(rows)
+        # Soldr's schedule as Mocker replays it. Mocker's clock starts at each worker's first submission.
+        soldr: list[dict[str, Any]] = [{} for _ in rows]
+        for c in set(route):
+            ix = sorted((j for j in range(len(rows)) if route[j] == c), key=lambda j: (submit[j], j))
+            for j, q in zip(ix, mocker.run([rows[j] | {"timestamp": submit[j]} for j in ix], 1)):
+                soldr_mocker[j] = submit[j] - release[j] + q["ttft_ms"]
+                t0 = submit[j] - q["arrival_time_ms"]
+                soldr[j] = dict(worker=c, release=release[j], start=t0 + q["first_admit_ms"],
+                                prefill_end=t0 + q["first_token_ms"], end=t0 + q["terminal_time_ms"],
+                                reused=q["reused_input_tokens"])
+        schedules = {"Soldr": soldr}
 
-    def visualize(self, schedules: dict[str, list[dict]]) -> None:
-        reqs, blk_size = self.trace.requests, self.trace.blk_size
-        swimlane(reqs, blk_size, schedules, f"swimlane_{self.name}.png", self.latency)
-        cache_lanes(reqs, blk_size, schedules, f"caches_{self.name}.png", self.latency)
+        rows = mocker.rows(reqs)
+
+        score = lambda recs: (soldr_ttft(rows, recs, self.latency, objective),
+                              summarize([q["ttft_ms"] / dt for q in recs], objective))
+        from dynamo._core import KvRouterConfig
+        # Mean (Soldr model, Mocker) score over mocker_runs replays. The first replay is kept as the schedule to plot.
+        def dynamo(name: str, **kwargs: Any) -> tuple[str, float, float]:
+            runs = [mocker.run(rows, self.cfg.num_caches, **kwargs) for _ in range(mocker_runs)]
+            schedules[name] = [dict(worker=q["decode_worker_idx"], release=q["arrival_time_ms"],
+                                    start=q["first_admit_ms"], prefill_end=q["first_token_ms"],
+                                    end=q["terminal_time_ms"], reused=q["reused_input_tokens"]) for q in runs[0]]
+            scores = [score(recs) for recs in runs]
+            return name, sum(s for s, _ in scores) / mocker_runs, sum(m for _, m in scores) / mocker_runs
+        soldr_soldr = summarize([solver.Value(t) for t in vars["ttfts"]], objective)
+        table = [("Soldr", soldr_soldr, summarize([t / dt for t in soldr_mocker], objective)),
+                 dynamo("Dynamo"),
+                 dynamo("Dynamo (w/o active tracking)", router_config=KvRouterConfig(router_track_active_blocks=False))]
+        label = "Avg TTFT" if objective == "mean" else f"P{objective * 100:g} TTFT"
+        print(f"{label:28s} {'Soldr':>7s} {'Mocker':>7s}")
+        for name, model_ttft, mocker_ttft in table:
+            print(f"{name:28s} {model_ttft:7.1f} {mocker_ttft:7.1f}")
+        return schedules
+
+    def visualize(self, schedules: Schedules) -> None:
+        plotter = Plotter(self.trace, schedules, self.latency)
+        plotter.swimlane(f"swimlane_{self.name}.png")
+        plotter.cache_lanes(f"caches_{self.name}.png")
 
     def dump_schedule(self, sol: Solution) -> None:
         reqs, blk_size = self.trace.requests, self.trace.blk_size
