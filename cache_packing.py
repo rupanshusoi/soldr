@@ -66,6 +66,9 @@ def from_weka(path, sessions, n=None, stagger_s=0, ms_per_step=default_latency.d
 def saving(u, v, blk_size, prefill_latency=default_latency):
     return prefill_latency(v.isl) - prefill_latency(v.isl, shared_tokens(u, v, blk_size))
 
+def sc_size(u):
+    return u.isl + u.osl
+
 def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, objective="mean"):
     N, C = len(trace), num_caches
     assert mem >= max([u.isl + u.osl for u in trace])
@@ -95,35 +98,39 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, obje
     for i in range(N):
         model.Add(starts[i] >= releases[i])
 
-    # reuses[i][j] means j gets the largest possible cache hit from i.
-    # TODO: Allow fine-grained eviction
-    shared = [[shared_tokens(u, v, blk_size) if i != j else 0 for j, v in enumerate(trace)] for i, u in enumerate(trace)]
-    pairs = [(i, j) for i in range(N) for j in range(N) if shared[i][j] > 0]
-    reuses = [[model.NewConstant(0)] * N for i in range(N)]
-    for i, j in pairs:
-        reuses[i][j] = model.NewBoolVar(f"reuse[{i},{j}]")
+    # The SC is not directly present in the constraints. For a given session,
+    # when a request is running, the SC is just its cache usage. When no request
+    # is running, we persist the last request's cache usage until the next
+    # request starts.
 
-    # To get a cache hit, you must start after your provider's prefill is done
-    for i, j in pairs:
-        model.Add(prefill_ends[i] <= starts[j]).OnlyEnforceIf(reuses[i][j])
-
-    # You may only get a cache hit from one provider
-    for j in range(N):
-        model.AddAtMostOne(reuses[i][j] for i in range(N))
-
-    # If i provides j a cache hit and j is routed to c, then i must also be routed to c
-    for i, j in pairs:
-        for c in range(C):
-            model.AddBoolOr([reuses[i][j].Not(), routes[j][c].Not(), routes[i][c]])
-
+    # hits[j] means j gets a full cache hit from its SC
+    hits = [model.NewConstant(0)] * N
     intervals = [[] for c in range(C)]
     sizes = [[] for c in range(C)]
+    for j, v in enumerate(trace):
+        if v.prev is None or saving(trace[v.prev], v, blk_size, prefill_latency) == 0:
+            continue
+        hits[j] = model.NewBoolVar(f"hit[{j}]")
+        gap = model.NewIntVar(v.think, horizon, f"gap[{j}]")
+        model.Add(gap == starts[j] - ends[v.prev])
+
+        # keeps[c] means the SC waits for j on c
+        keeps = [model.NewBoolVar(f"keep[{j},{c}]") for c in range(C)]
+        model.Add(sum(keeps) == hits[j])
+        for c in range(C):
+            model.AddImplication(keeps[c], routes[v.prev][c])
+            model.AddImplication(keeps[c], routes[j][c])
+            intervals[c].append(model.NewOptionalIntervalVar(ends[v.prev], gap, starts[j], keeps[c], f"sc[{j},{c}]"))
+            sizes[c].append(sc_size(trace[v.prev]))
+
     prefills = [[] for c in range(C)]
     for j, v in enumerate(trace):
-        # Full cache hit costs 1 timestep
-        prefill = model.NewIntVar(1, prefill_latency(v.isl), f"prefill[{j}]")
-        model.Add(prefill == prefill_latency(v.isl) - sum(reuses[i][j] * saving(u, v, blk_size, prefill_latency)
-                                                          for i, u in enumerate(trace) if shared[i][j] > 0))
+        full = prefill_latency(v.isl)
+        if v.prev is None:
+            prefill = full
+        else:
+            prefill = model.NewIntVar(1, full, f"prefill[{j}]")
+            model.Add(prefill == full - hits[j] * saving(trace[v.prev], v, blk_size, prefill_latency))
         duration = prefill + v.osl
         model.Add(prefill_ends[j] == starts[j] + prefill)
         for c in range(C):
@@ -133,47 +140,7 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, obje
 
     for c in range(C):
         model.AddNoOverlap(prefills[c])
-
-    evicts, providers = [], []
-    for i, u in enumerate(trace):
-        # Time at which we evict u's prompt
-        evict = model.NewIntVar(0, horizon, f"evict[{i}]")
-        model.add(evict >= ends[i])
-
-        # Is u providing a cache hit to anybody?
-        is_provider = model.NewBoolVar(f"provider[{i}]")
-        evicts.append(evict)
-        providers.append(is_provider)
-
-        for j in range(N):
-            if shared[i][j] > 0:
-                # If v is getting a cache hit from u, u's prompt must not be evicted until v starts
-                model.Add(evict >= starts[j]).OnlyEnforceIf(reuses[i][j])
-                # ... and u is a provider
-                model.AddImplication(reuses[i][j], is_provider)
-
-        _evict = model.NewIntVar(0, horizon, f"_evict[{i}]")
-        for c in range(C):
-            # cond == is_provider AND routes[i][c]
-            # It's annoying that CP-SAT doesn't let us write SAT formulas naturally...
-            cond = model.NewBoolVar(f"cond[{i},{c}]")
-            model.AddBoolOr([is_provider.Not(), routes[i][c].Not(), cond])
-            model.AddImplication(cond, is_provider)
-            model.AddImplication(cond, routes[i][c])
-
-            intervals[c].append(model.NewOptionalIntervalVar(ends[i], _evict, evict, cond, f"eviction[{i},{c}]"))
-            # TODO: This is an overestimate I think
-            sizes[c].append(max(shared[i]))
-
-    for c in range(C):
         model.AddCumulative(intervals[c], sizes[c], mem)
-
-    # waits = []
-    # for i, u in enumerate(trace):
-    #     wait = model.NewIntVar(0, horizon, f"waits[{i}]")
-    #     model.Add(wait == starts[i] - u.arrival)
-    #     waits.append(wait)
-    # model.minimize(sum(waits))
 
     ttfts = []
     for i, u in enumerate(trace):
@@ -194,8 +161,8 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, obje
         model.Add(sum(lates) <= N - k)
         model.minimize(quantile)
 
-    return model, dict(routes=routes, starts=starts, ends=ends, prefill_ends=prefill_ends, reuses=reuses, releases=releases,
-                       evicts=evicts, providers=providers, ttfts=ttfts, quantile=quantile)
+    return model, dict(routes=routes, starts=starts, ends=ends, prefill_ends=prefill_ends, hits=hits, releases=releases,
+                       ttfts=ttfts, quantile=quantile)
 
 class GapLogger(cp_model.CpSolverSolutionCallback):
     def on_solution_callback(self):
@@ -222,15 +189,18 @@ def solve(model, vars, objective="mean", num_workers=0):
 
 def dump_schedule(config, trace, blk_size, solver, status, vars, prefill_latency):
     value = solver.Value
+    succ = {v.prev: j for j, v in enumerate(trace) if v.prev is not None}
     requests = []
     for j, v in enumerate(trace):
-        src = next((i for i in range(len(trace)) if value(vars["reuses"][i][j])), None)
+        hit = bool(value(vars["hits"][j]))
+        # The SC that j leaves is dropped when j ends, unless its successor uses it
+        kept = j in succ and value(vars["hits"][succ[j]])
         requests.append(dict(
             id=j, cache=next(c for c, r in enumerate(vars["routes"][j]) if value(r)), prev=v.prev, think=v.think,
             isl=v.isl, osl=v.osl, release=value(vars["releases"][j]), start=value(vars["starts"][j]),
-            prefill_end=value(vars["prefill_ends"][j]), end=value(vars["ends"][j]), src=src,
-            hit=0 if src is None else shared_tokens(trace[src], v, blk_size), prefill_full=prefill_latency(v.isl),
-            ttft=value(vars["ttfts"][j]), evict=value(vars["evicts"][j]) if value(vars["providers"][j]) else None))
+            prefill_end=value(vars["prefill_ends"][j]), end=value(vars["ends"][j]), src=v.prev if hit else None,
+            hit=shared_tokens(trace[v.prev], v, blk_size) if hit else 0, prefill_full=prefill_latency(v.isl),
+            ttft=value(vars["ttfts"][j]), evict=value(vars["starts"][succ[j]]) if kept else None))
     path = f"schedule_{config}.json"
     with open(path, "w") as f:
         json.dump(dict(params=prefill_latency.config, decode_ms=prefill_latency.decode_ms, blk_size=blk_size,
@@ -242,7 +212,7 @@ if __name__ == "__main__":
     # num_requests = 128
     # trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
 
-    num_requests = 512
+    num_requests = None
     num_caches = 4
     sessions = 4 * num_caches
     # 900 s is the average session length for Weka
