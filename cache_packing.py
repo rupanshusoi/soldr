@@ -3,7 +3,8 @@ from dataclasses import dataclass, replace
 from itertools import islice
 from math import ceil
 from ortools.sat.python import cp_model
-from calibrate import MockerLatency, compare, compute_usage, mocker_recs, peak_working_set, shared_tokens, swimlane
+from calibrate import (MockerLatency, cache_lanes, compare, compute_usage, mocker_recs, peak_working_set, shared_tokens,
+                       swimlane)
 
 @dataclass
 class Request:
@@ -241,11 +242,11 @@ if __name__ == "__main__":
     # num_requests = 128
     # trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
 
-    num_requests = 128
+    num_requests = 512
     num_caches = 4
-    sessions = 48 * num_caches
+    sessions = 4 * num_caches
     # 900 s is the average session length for Weka
-    stagger_s = 900 // sessions
+    stagger_s = 5
     objective = "mean"
 
     trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=num_requests, stagger_s=stagger_s)
@@ -266,4 +267,5 @@ if __name__ == "__main__":
         config = f"{num_caches}c_{sessions}s_{len(trace)}r_{stagger_s}st_{default_latency.config.split('-')[0]}"
         schedules = compare(trace, blk_size, solver, vars, default_latency, objective)
         swimlane(trace, blk_size, schedules, f"swimlane_{config}.png", default_latency)
+        cache_lanes(trace, blk_size, schedules, f"caches_{config}.png", default_latency)
         dump_schedule(config, trace, blk_size, solver, status, vars, default_latency)

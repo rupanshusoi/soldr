@@ -156,8 +156,8 @@ def compare(trace, blk_size, solver, vars, prefill_latency, objective="mean", mo
         return name, sum(s for s, _ in runs) / mocker_runs, sum(m for _, m in runs) / mocker_runs
     soldr_soldr = summarize([solver.Value(t) for t in vars["ttfts"]], objective)
     table = [("Soldr", soldr_soldr, summarize([t / dt for t in soldr_mocker], objective)),
-             mocker("Mocker"),
-             mocker("Mocker (w/o active tracking)", router_config=KvRouterConfig(router_track_active_blocks=False))]
+             mocker("Dynamo"),
+             mocker("Dynamo (w/o active tracking)", router_config=KvRouterConfig(router_track_active_blocks=False))]
     label = "Avg TTFT" if objective == "mean" else f"P{objective * 100:g} TTFT"
     print(f"{label:28s} {'Soldr':>7s} {'Mocker':>7s}")
     for name, soldr, mock in table:
@@ -174,6 +174,106 @@ def shared_tokens(u, v, blk_size):
     return min(count * blk_size, u.isl, v.isl)
 
 
+# Session (its first request) of each request
+def sessions_of(trace):
+    session = []
+    for j, u in enumerate(trace):
+        session.append(j if u.prev is None else session[u.prev])
+    return session
+
+
+# For each request, the tokens it shares with each earlier request of its session
+def earlier_shared(trace, blk_size):
+    session = sessions_of(trace)
+    return [{i: shared_tokens(trace[i], v, blk_size) for i in range(j) if session[i] == session[j]}
+            for j, v in enumerate(trace)]
+
+
+# Requests that reuse over a block less than the largest hit an earlier request of their session offers: a routing
+# miss if no request with that prefix ran on the request's worker, else an eviction miss
+def misses(trace, blk_size, recs):
+    miss = {"routing": [], "eviction": []}
+    for j, (shared, q) in enumerate(zip(earlier_shared(trace, blk_size), recs)):
+        best = max(shared.values(), default=0)
+        if best - q["reused"] > blk_size:
+            local = any(s == best and recs[i]["worker"] == q["worker"] for i, s in shared.items())
+            miss["eviction" if local else "routing"].append(j)
+    return miss
+
+
+def cache_lanes(trace, blk_size, schedules, path, prefill_latency, dpi=300):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
+
+    session = sessions_of(trace)
+    lane = {s: k for k, s in enumerate(dict.fromkeys(session))}
+    workers = 1 + max(q["worker"] for recs in schedules.values() for q in recs)
+    colors = plt.get_cmap("tab20").colors
+    plt.style.use("dark_background")
+    fig, axes = plt.subplots(len(schedules), workers, sharex=True, sharey=True, squeeze=False,
+                             figsize=(4.5 * workers, 3.2 * len(schedules)))
+    for row, (name, recs) in zip(axes, schedules.items()):
+        miss = misses(trace, blk_size, recs)
+        peaks = []
+        for w, ax in enumerate(row):
+            mine = [j for j, q in enumerate(recs) if q["worker"] == w]
+            # Breakpoints of the stack: a band changes height at a request's start and ends at the end of its last
+            last_end = {}
+            for j in mine:
+                last_end[session[j]] = max(last_end.get(session[j], 0), recs[j]["end"])
+            times = sorted({recs[j]["start"] for j in mine} | set(last_end.values()))
+            index = {t: k for k, t in enumerate(times)}
+            # held[s][k] is the share of capacity session s holds from times[k] to times[k + 1]
+            held = {s: [0.0] * len(times) for s in last_end}
+            for j in sorted(mine, key=lambda j: recs[j]["start"]):
+                size = (trace[j].isl + trace[j].osl) / prefill_latency.kv_capacity
+                for k in range(index[recs[j]["start"]], index[last_end[session[j]]]):
+                    held[session[j]][k] = size
+            order = sorted(held, key=lambda s: lane[s])
+            if order:
+                ax.stackplot([t / 1000 for t in times], [[100 * h for h in held[s]] for s in order], step="post", lw=0,
+                             colors=[colors[lane[s] % len(colors)] for s in order])
+            peaks.append(max((sum(held[s][k] for s in order) for k in range(len(times))), default=0))
+
+            # A miss is drawn in the middle of the band of its session
+            for kind, style in [("routing", dict(marker="x", color="#ff4d4d")),
+                                ("eviction", dict(marker="o", facecolors="none", edgecolors="white"))]:
+                js = [j for j in miss[kind] if recs[j]["worker"] == w]
+                ys = []
+                for j in js:
+                    k = index[recs[j]["start"]]
+                    below = sum(held[s][k] for s in order if lane[s] < lane[session[j]])
+                    ys.append(100 * (below + held[session[j]][k] / 2))
+                ax.scatter([recs[j]["start"] / 1000 for j in js], ys, s=22, lw=1.1, zorder=3, **style)
+
+            ax.axhline(100, color="white", ls="--", lw=0.8)
+            ax.set_title(f"worker {w}: {len(order)} sessions, peak {peaks[-1]:.0%}", fontsize=9)
+            ax.grid(axis="y", color="0.25", lw=0.5)
+            ax.set_axisbelow(True)
+        row[0].set_ylabel("session caches")
+        label = row[0].annotate(name, xy=(0, 1), xycoords="axes fraction", xytext=(0, 22), textcoords="offset points",
+                                fontsize=11, fontweight="bold")
+        row[0].annotate(f"{len(miss['eviction'])} eviction "
+                        f"misses, {len(miss['routing'])} routing misses", xy=(1, 0), xycoords=label, xytext=(8, 0),
+                        textcoords="offset points", va="bottom", fontsize=10).set_in_layout(False)
+        label.set_in_layout(False)
+    for ax in axes[-1]:
+        ax.set_xlabel("time (s)")
+    handles = [Patch(color=colors[k % len(colors)], label=f"session {k}") for k in range(len(lane))] + [
+        Line2D([], [], color="white", ls="--", lw=0.8, label="KV capacity"),
+        Line2D([], [], color="#ff4d4d", marker="x", ls="", label="routing miss"),
+        Line2D([], [], markerfacecolor="none", markeredgecolor="white", marker="o", ls="", label="eviction miss")]
+    rows = ceil(len(handles) / 12)
+    fig.legend(handles=handles, loc="upper center", ncol=ceil(len(handles) / rows), fontsize=8, frameon=False)
+    fig.tight_layout(rect=(0, 0, 1, 1 - (0.1 + 0.22 * rows) / fig.get_figheight()), h_pad=3.5)
+    fig.savefig(path, dpi=dpi)
+    plt.close(fig)
+    print("Wrote", path)
+
+
 def swimlane(trace, blk_size, schedules, path, prefill_latency, dpi=300):
     import matplotlib
     matplotlib.use("Agg")
@@ -187,9 +287,7 @@ def swimlane(trace, blk_size, schedules, path, prefill_latency, dpi=300):
     # Lanes in order of first appearance in the trace, which is by estimated release
     lane = {s: k for k, s in enumerate(dict.fromkeys(session))}
     y = [lane[s] for s in session]
-    earlier = [[i for i in range(j) if session[i] == session[j]] for j in range(len(trace))]
-    shared = [{i: shared_tokens(trace[i], v, blk_size) for i in earlier[j]} for j, v in enumerate(trace)]
-    achievable = [max(s.values(), default=0) for s in shared]
+    achievable = [max(shared.values(), default=0) for shared in earlier_shared(trace, blk_size)]
 
     workers = 1 + max(q["worker"] for recs in schedules.values() for q in recs)
     colors = plt.get_cmap("tab10" if workers <= 10 else "tab20").colors
@@ -205,13 +303,8 @@ def swimlane(trace, blk_size, schedules, path, prefill_latency, dpi=300):
         ax.barh(y, width(prefill_end, end), left=prefill_end, height=0.8, color=color, alpha=0.35, lw=0, zorder=2)
         ax.barh(y, width(start, prefill_end), left=start, height=0.8, color=color, lw=0, zorder=3)
 
-        miss = {"routing": [], "eviction": []}
-        switches = 0
-        for j, q in enumerate(recs):
-            switches += trace[j].prev is not None and recs[trace[j].prev]["worker"] != q["worker"]
-            if achievable[j] - q["reused"] > blk_size:
-                local = any(shared[j][i] == achievable[j] and recs[i]["worker"] == q["worker"] for i in earlier[j])
-                miss["eviction" if local else "routing"].append(j)
+        miss = misses(trace, blk_size, recs)
+        switches = sum(u.prev is not None and recs[u.prev]["worker"] != q["worker"] for u, q in zip(trace, recs))
         ax.scatter([start[j] for j in miss["routing"]], [y[j] for j in miss["routing"]], marker="x", s=30, lw=1.2,
                    color="#ff4d4d", zorder=4)
         ax.scatter([start[j] for j in miss["eviction"]], [y[j] for j in miss["eviction"]], marker="o", s=30, lw=1.2,
@@ -222,7 +315,7 @@ def swimlane(trace, blk_size, schedules, path, prefill_latency, dpi=300):
         ax.annotate(f"mean TTFT {ttft:.1f} steps, {reuse:.0%} of achievable reuse, {len(miss['routing'])} routing misses, "
                     f"{len(miss['eviction'])} eviction misses, {switches} worker switches", xy=(1, 0), xycoords=title,
                     xytext=(8, 0), textcoords="offset points", va="bottom", fontsize=10)
-        ax.set_ylabel("session (by first request)")
+        ax.set_ylabel("session")
         ax.grid(axis="x", color="0.25", lw=0.5, zorder=0)
         ax.set_axisbelow(True)
     ax.set_ylim(len(lane) - 0.4, -0.6)
