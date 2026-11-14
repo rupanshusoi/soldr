@@ -30,6 +30,7 @@ class Loader:
         return Trace(trace, 512)
 
     # Arrival timestamps for Weka are ignored, we use only think_time. Session starts are staggered.
+    # Requests of a raw session that share their first block form a sub-session. Sub-sessions are our sessions.
     def weka(self, path: str, sessions: int, n: int | None = None, stagger_s: float = 0,
              idle_cap_s: float = 300) -> Trace:
         chosen = []
@@ -51,17 +52,28 @@ class Loader:
         offset = 0
         for s, session in enumerate(chosen):
             t = s * stagger_s
+            # Last request of each sub-session and when it ends on the est timeline
+            last: dict[int, tuple[int, float]] = {}
             for k, r in enumerate(session["requests"]):
                 # Cap think time. This appears to be a standard transformation for
                 # Weka and helps decrease the horizon for us.
                 think = 0 if k == 0 else min(r["think_time"], idle_cap_s)
                 t += think
                 est.append(t)
-                arrival = round(s * stagger_s * 1000) // self.ms_per_step if k == 0 else None
-                prev = None if k == 0 else len(trace) - 1
+                sub = r["hash_ids"][0]
+                prev, arrival = None, None
+                if sub not in last:
+                    # A sub-session starts at its offset from the start of its raw session
+                    arrival, think = round(t * 1000) // self.ms_per_step, 0
+                else:
+                    prev, end = last[sub]
+                    # Requests of other sub-sessions ran in between
+                    if prev != len(trace) - 1:
+                        think = t - end
                 trace.append(Request(r["in"], max(1, r["out"]), arrival, [h + offset for h in r["hash_ids"]], prev,
                                      round(think * 1000) // self.ms_per_step))
                 t += r["api_time"]
+                last[sub] = (len(trace) - 1, t)
             offset += 1 + max(h for r in session["requests"] for h in r["hash_ids"])
 
         assert n is None or len(trace) >= n
@@ -85,9 +97,6 @@ def sessions_of(reqs: list[Request]) -> list[int]:
         session.append(j if u.prev is None else session[u.prev])
     return session
 
-# For each request, the tokens it shares with each earlier request of its session
-def earlier_shared(trace: Trace) -> list[dict[int, int]]:
+def prev_shared(trace: Trace) -> list[int]:
     reqs = trace.requests
-    session = sessions_of(reqs)
-    return [{i: shared_tokens(reqs[i], v, trace.blk_size) for i in range(j) if session[i] == session[j]}
-            for j, v in enumerate(reqs)]
+    return [0 if v.prev is None else shared_tokens(reqs[v.prev], v, trace.blk_size) for v in reqs]

@@ -6,19 +6,16 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 from mocker import MockerLatency
-from workload import Trace, earlier_shared, sessions_of
+from workload import Trace, prev_shared, sessions_of
 
 # Per-request worker, times (ms) and reused tokens for each scheduler
 Schedules = dict[str, list[dict[str, Any]]]
 
-# Requests that reuse over a block less than the largest hit an earlier request of their session offers: a routing
-# miss if no request with that prefix ran on the request's worker, else an eviction miss
 def misses(trace: Trace, recs: list[dict[str, Any]]) -> dict[str, list[int]]:
     miss: dict[str, list[int]] = {"routing": [], "eviction": []}
-    for j, (shared, q) in enumerate(zip(earlier_shared(trace), recs)):
-        best = max(shared.values(), default=0)
-        if best - q["reused"] > trace.blk_size:
-            local = any(s == best and recs[i]["worker"] == q["worker"] for i, s in shared.items())
+    for j, (u, best, q) in enumerate(zip(trace.requests, prev_shared(trace), recs)):
+        if u.prev is not None and best - q["reused"] > trace.blk_size:
+            local = recs[u.prev]["worker"] == q["worker"]
             miss["eviction" if local else "routing"].append(j)
     return miss
 
@@ -77,7 +74,7 @@ class Plotter:
                 ax.set_title(f"worker {w}: {len(order)} sessions, peak {peaks[-1]:.0%}", fontsize=9)
                 ax.grid(axis="y", color="0.25", lw=0.5)
                 ax.set_axisbelow(True)
-            row[0].set_ylabel("session caches")
+            row[0].set_ylabel("live state")
             label = row[0].annotate(name, xy=(0, 1), xycoords="axes fraction", xytext=(0, 22),
                                     textcoords="offset points", fontsize=11, fontweight="bold")
             row[0].annotate(f"{len(miss['eviction'])} eviction "
@@ -90,7 +87,7 @@ class Plotter:
             Line2D([], [], color="white", ls="--", lw=0.8, label="KV capacity"),
             Line2D([], [], color="#ff4d4d", marker="x", ls="", label="routing miss"),
             Line2D([], [], markerfacecolor="none", markeredgecolor="white", marker="o", ls="", label="eviction miss")]
-        rows = ceil(len(handles) / 12)
+        rows = ceil(len(handles) / (3 * workers))
         fig.legend(handles=handles, loc="upper center", ncol=ceil(len(handles) / rows), fontsize=8, frameon=False)
         fig.tight_layout(rect=(0, 0, 1, 1 - (0.1 + 0.22 * rows) / fig.get_figheight()), h_pad=3.5)
         fig.savefig(path, dpi=dpi)
@@ -100,7 +97,7 @@ class Plotter:
     def swimlane(self, path: str, dpi: int = 300) -> None:
         reqs, lane, workers = self.trace.requests, self.lane, self.workers
         y = [lane[s] for s in self.session]
-        achievable = [max(shared.values(), default=0) for shared in earlier_shared(self.trace)]
+        achievable = prev_shared(self.trace)
 
         colors = plt.get_cmap("tab10" if workers <= 10 else "tab20").colors # type: ignore[attr-defined]
         plt.style.use("dark_background")

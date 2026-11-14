@@ -15,6 +15,7 @@ class Config:
     trace: str = "traces/weka_256k.jsonl"
     num_caches: int = 4
     sessions_per_cache: int = 4
+    # All requests if None
     num_requests: int | None = None
     stagger_s: float = 5
     objective: Objective = "mean"
@@ -44,9 +45,6 @@ class Vars(TypedDict):
 def saving(u: Request, v: Request, blk_size: int, prefill_latency: MockerLatency) -> int:
     return prefill_latency(v.isl) - prefill_latency(v.isl, shared_tokens(u, v, blk_size))
 
-def sc_size(u: Request) -> int:
-    return u.isl + u.osl
-
 class GapLogger(cp_model.CpSolverSolutionCallback):
     def on_solution_callback(self) -> None:
         obj, bound = self.ObjectiveValue(), self.BestObjectiveBound()
@@ -67,7 +65,6 @@ class Soldr:
         self.cfg = cfg
         self.latency = MockerLatency.load(cfg.params)
         loader = Loader(self.latency.decode_ms)
-        # self.trace = loader.mooncake("traces/mooncake_conversation.jsonl", n=128)
         self.trace = loader.weka(cfg.trace, sessions=cfg.sessions, n=cfg.num_requests, stagger_s=cfg.stagger_s)
         self.name = cfg.name(self.trace)
         self.mocker = Mocker(self.latency, self.trace.blk_size)
@@ -146,7 +143,7 @@ class Soldr:
                 model.add_implication(keeps[c], routes[j][c])
                 sc = model.new_optional_interval_var(ends[v.prev], gap, starts[j], keeps[c], f"sc[{j},{c}]")
                 intervals[c].append(sc)
-                sizes[c].append(sc_size(reqs[v.prev]))
+                sizes[c].append(reqs[v.prev].isl + reqs[v.prev].osl)
 
         prefills: list[list[cp_model.IntervalVar]] = [[] for c in range(C)]
         for j, v in enumerate(reqs):
@@ -281,7 +278,7 @@ class Soldr:
             json.dump(dict(params=self.latency.config, decode_ms=self.latency.decode_ms, blk_size=blk_size,
                            status=solver.StatusName(sol.status), obj=solver.ObjectiveValue(),
                            bound=solver.BestObjectiveBound(), requests=requests), f, indent=1)
-        print("\nWrote", path)
+        print("Wrote", path)
 
     def run(self) -> None:
         self.log_stats()
