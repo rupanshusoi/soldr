@@ -38,7 +38,7 @@ class Vars(TypedDict):
     prefill_ends: list[cp_model.IntVar]
     hits: list[cp_model.IntVar]
     releases: list[Expr]
-    ttfts: list[cp_model.IntVar]
+    ttfts: list[Expr]
     quantile: cp_model.IntVar | None
 
 # Reduction in prefill time of v if it gets a cache hit from u
@@ -46,9 +46,14 @@ def saving(u: Request, v: Request, blk_size: int, prefill_latency: MockerLatency
     return prefill_latency(v.isl) - prefill_latency(v.isl, shared_tokens(u, v, blk_size))
 
 class GapLogger(cp_model.CpSolverSolutionCallback):
+    def __init__(self, scale: int = 1) -> None:
+        super().__init__()
+        self.scale = scale
+
     def on_solution_callback(self) -> None:
         obj, bound = self.ObjectiveValue(), self.BestObjectiveBound()
-        print(f"[{self.WallTime():.1f}s] obj={obj:.0f} bound={bound:.0f} gap={(obj - bound) / max(abs(obj), 1):.1%}")
+        gap = (obj - bound) / max(abs(obj), 1)
+        print(f"[{self.WallTime():.1f}s] obj={obj / self.scale:.1f} bound={bound / self.scale:.1f} gap={gap:.1%}")
 
 @dataclass
 class Solution:
@@ -156,6 +161,7 @@ class Soldr:
                 model.add(prefill == full - hits[j] * saving(reqs[v.prev], v, blk_size, prefill_latency))
             duration = prefill + v.osl
             model.add(prefill_ends[j] == starts[j] + prefill)
+            model.add(ends[j] == prefill_ends[j] + v.osl)
             for c in range(C):
                 intervals[c].append(model.new_optional_interval_var(starts[j], duration, ends[j], routes[j][c], f"lifetime[{j},{c}]"))
                 sizes[c].append(v.isl + v.osl)
@@ -165,12 +171,7 @@ class Soldr:
             model.add_no_overlap(prefills[c])
             model.add_cumulative(intervals[c], sizes[c], mem)
 
-        ttfts = []
-        for i, u in enumerate(reqs):
-            ttft = model.new_int_var(0, horizon, f"ttft[{i}]")
-            # Weird, we can equivalently write ttft = prefill_ends[i] - releases[i] but that confuses the solver...
-            model.add(ttft == ends[i] - u.osl - releases[i])
-            ttfts.append(ttft)
+        ttfts: list[Expr] = [ends[i] - u.osl - releases[i] for i, u in enumerate(reqs)]
 
         quantile = None
         if objective == "mean":
@@ -193,13 +194,14 @@ class Soldr:
         print("Built model, beginning solve...")
         solver = cp_model.CpSolver()
         solver.parameters.num_workers = num_workers
-        sol = Solution(solver, solver.Solve(model, GapLogger()), vars)
+        scale = len(vars["ttfts"]) if cfg.objective == "mean" else 1
+        sol = Solution(solver, solver.Solve(model, GapLogger(scale)), vars)
         print(solver.StatusName(sol.status))
 
         if sol.found:
             if cfg.objective == "mean":
                 ttfts = vars["ttfts"]
-                print("Avg TTFT: ", sum(solver.Value(t) for t in ttfts) / len(ttfts))
+                print(f"Avg TTFT: {sum(solver.Value(t) for t in ttfts) / len(ttfts):.1f}")
             else:
                 assert vars["quantile"] is not None
                 print(f"P{cfg.objective * 100:g} TTFT: ", solver.Value(vars["quantile"]))
