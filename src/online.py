@@ -288,13 +288,103 @@ class OnlineSoldr:
         # Events wake us when a delayed request can go, the timer is for a delay the solver chose for another reason
         return now + min(delayed) * dt if delayed else None
 
+# A scheduler by hand that rations KV memory the way Online Soldr turned out to. It is told think times and output
+# lengths. A request goes to the worker where its first token is nearest, and only once that worker has room for all of
+# it and no prefill in progress. Room is made by dropping session caches, cheapest first by the prefill they save per
+# token-second they would sit idle, and only caches that sit idle for longer than it takes to rebuild them.
+class Rationer:
+    def __init__(self, patience: float = 1, aging: float = 0) -> None:
+        # A cache is dropped for a request if its session is away for more than patience times its rebuild time
+        self.patience = patience
+        # Each ms a request has waited counts as this many ms that the caches in its way are away
+        self.aging = aging
+
+    def progress(self) -> str:
+        return ""
+
+    def wake(self, loop: Loop, events: list[Event]) -> None:
+        sim, reqs, p, dt = loop.sim, loop.reqs, loop.p, loop.dt
+        now, C = sim.now, len(sim.workers)
+        size = lambda j: sim.blocks(reqs[j].isl + reqs[j].osl)
+        for e in events:
+            if e.kind == "end" and e.id not in loop.succ:
+                sim.evict(e.worker, sim.session[e.id])
+        waiting = loop.waiting()
+        if not waiting:
+            return None
+        # ms of prefill that the requests on each worker are yet to do
+        backlog = [sum(p.prefill_ms(r.isl, r.computed if r.admit is not None else sim.hit(c, r.id))
+                       for r in [*w.running, *w.waiting] if r.first_token is None) for c, w in enumerate(sim.workers)]
+        free = [p.kv_capacity - sum(size(r.id) for r in [*w.running, *w.waiting]) - sum(e.tokens for e in w.idle.values())
+                for w in sim.workers]
+
+        # (ms its session is still away, ms to rebuild it) of an idle cache
+        def away(k: int) -> tuple[float, float]:
+            v = loop.succ[k]
+            return max(0.0, loop.release[v] - now), saving(reqs[k], reqs[v], sim.blk_size, p) * dt
+
+        # Cheapest way to run j on c: (ms to its first token, sessions whose caches to drop), if it can be made to fit
+        def option(j: int, c: int) -> tuple[float, list[int]] | None:
+            idle, session = sim.workers[c].idle, sim.session[j]
+            need = size(j) - (idle[session].tokens if session in idle else 0) - free[c]
+            cost, victims = backlog[c] + p.prefill_ms(reqs[j].isl, sim.hit(c, j)), list[int]()
+            scores = {s: away(e.id) for s, e in idle.items() if s != session}
+            for s in sorted(scores, key=lambda s: scores[s][1] / (idle[s].tokens * max(scores[s][0], 1))):
+                if need <= 0:
+                    break
+                gone, rebuild = scores[s]
+                if gone + self.aging * (now - loop.release[j]) > self.patience * rebuild:
+                    victims.append(s)
+                    need -= idle[s].tokens
+                    cost += rebuild
+            return (cost, victims) if need <= 0 else None
+
+        def send(j: int, c: int, victims: list[int]) -> None:
+            session = sim.session[j]
+            for s in victims:
+                free[c] += sim.workers[c].idle[s].tokens
+                sim.evict(c, s)
+            for d, w in enumerate(sim.workers):
+                if session in w.idle:
+                    free[d] += w.idle[session].tokens
+                    # Left behind for another worker
+                    if d != c:
+                        sim.evict(d, session)
+            free[c] -= size(j)
+            backlog[c] += p.prefill_ms(reqs[j].isl, sim.hit(c, j))
+            loop.send(j, c)
+
+        # Nearest first token first. A request whose best worker is still prefilling is held for it.
+        while waiting:
+            best: tuple[float, int, int, list[int]] | None = None
+            for j in waiting:
+                for c in range(C):
+                    if (o := option(j, c)) is not None and (best is None or o[0] < best[0]):
+                        best = (o[0], j, c, o[1])
+            if best is None:
+                break
+            _, j, c, victims = best
+            waiting.remove(j)
+            if backlog[c] == 0:
+                send(j, c, victims)
+        # Nothing runs and what waits fits nowhere: the first to wait takes the emptiest worker, at any cost
+        if not any(w.running or w.waiting for w in sim.workers) and (waiting := loop.waiting()):
+            j, c = waiting[0], max(range(C), key=lambda c: free[c])
+            idle, victims = sim.workers[c].idle, list[int]()
+            for s in sorted((s for s in idle if s != sim.session[j]), key=lambda s: -away(idle[s].id)[0]):
+                if free[c] + sum(idle[x].tokens for x in victims) >= size(j):
+                    break
+                victims.append(s)
+            send(j, c, victims)
+        return None
+
 def stats(recs: list[dict[str, Any]], trace: Trace) -> dict[str, float]:
     ttfts = sorted(q["prefill_end"] - q["release"] for q in recs)
     sessions: dict[int, list[dict[str, Any]]] = {}
     for s, q in zip(sessions_of(trace.requests), recs):
         sessions.setdefault(s, []).append(q)
     quantile = lambda f: ttfts[ceil(f * len(ttfts)) - 1]
-    return dict(mean=sum(ttfts) / len(ttfts), p50=quantile(0.5), p95=quantile(0.95), max=ttfts[-1],
+    return dict(mean=sum(ttfts) / len(ttfts), p50=quantile(0.5), p90=quantile(0.9), p95=quantile(0.95), max=ttfts[-1],
                 reused=sum(q["reused"] for q in recs) / sum(u.isl for u in trace.requests),
                 e2e=sum(q["end"] - q["release"] for q in recs) / len(recs),
                 # From the release of a session's first request to the end of its last, think times included
@@ -336,17 +426,19 @@ class Online:
         policy, loop = OnlineSoldr(cfg), self.loop()
         schedules["Online Soldr"] = loop.run(policy, cfg.log_s)
         rows["Online Soldr"] = stats(schedules["Online Soldr"], trace)
+        schedules["Rationer"] = self.loop().run(Rationer())
+        rows["Rationer"] = stats(schedules["Rationer"], trace)
 
         # The best run by mean TTFT is the one reported and plotted
         best = lambda runs: min(runs, key=lambda recs: stats(recs, trace)["mean"])
         from dynamo._core import KvRouterConfig
         mocker = Mocker(self.p, trace.blk_size)
-        for label, track in [("KV router", True), ("KV router w/o active tracking", False)]:
-            name = f"{label}, best of {cfg.router_runs}"
+        for label, track in [("Dynamo", True), ("Dynamo w/o tracking", False)]:
+            name = f"{label} (best of {cfg.router_runs})"
             schedules[name] = best([self.loop().run(KvRouter(seed, track)) for seed in range(cfg.router_runs)])
             rows[name] = stats(schedules[name], trace)
             if cfg.mocker_runs:
-                name = f"{label} in Mocker, best of {cfg.mocker_runs}"
+                name = f"{label} in Mocker (best of {cfg.mocker_runs})"
                 print(f"Replaying {label} in Mocker {cfg.mocker_runs} times", flush=True)
                 router_config = KvRouterConfig(router_track_active_blocks=track)
                 schedules[name] = best([[dict(worker=q["decode_worker_idx"], release=q["arrival_time_ms"],
@@ -357,11 +449,11 @@ class Online:
                                         for _ in range(cfg.mocker_runs)])
                 rows[name] = stats(schedules[name], trace)
 
-        print(f"{'TTFT (ms)':52s} {'mean':>8s} {'p50':>8s} {'p95':>8s} {'max':>8s} {'reused':>7s} {'E2E':>8s} "
-              f"{'ITL':>6s} {'session E2E (s)':>16s}")
+        width = max(map(len, rows))
+        print(f"{'':{width}s} {'TTFT avg/p50/p90 (ms)':>22s} {'reuse':>7s} {'session E2E (s)':>16s}")
         for name, s in rows.items():
-            print(f"{name:52s} {s['mean']:8.0f} {s['p50']:8.0f} {s['p95']:8.0f} {s['max']:8.0f} {s['reused']:7.1%} "
-                  f"{s['e2e']:8.0f} {s['itl']:6.1f} {s['session_e2e'] / 1000:16.1f}")
+            ttft = f"{s['mean']:.0f}/{s['p50']:.0f}/{s['p90']:.0f}"
+            print(f"{name:{width}s} {ttft:>22s} {s['reused']:7.1%} {s['session_e2e'] / 1000:16.1f}")
 
         print("Plotting", flush=True)
         plotter = Plotter(trace, schedules, self.p)
