@@ -14,8 +14,8 @@ from workload import Loader, Trace, sessions_of
 
 @dataclass
 class Config(soldr.Config):
-    sessions_per_cache: int = 7
-    num_requests: int | None = None
+    sessions_per_cache: int = 4
+    num_requests: int | None = 64
     # The solver sees this many unsent turns of each session, and the sessions that start within lookahead_s
     lookahead_turns: int = 2
     lookahead_s: float = 60
@@ -62,11 +62,7 @@ class Loop:
         while done < len(self.reqs):
             if log_s is not None and time.time() - logged >= log_s:
                 logged = time.time()
-                ttfts = [q["prefill_end"] - q["release"] for q in sim.recs.values() if "prefill_end" in q]
-                active = sum(len(w.running) + len(w.waiting) for w in sim.workers)
-                print(f"[{logged - t0:4.0f}s] simulated {sim.now / 1000:.0f} s, {done}/{len(self.reqs)} requests done, "
-                      f"{active} in flight, {len(self.waiting())} held back, mean TTFT so far "
-                      f"{sum(ttfts) / max(1, len(ttfts)):.0f} ms{policy.progress()}", flush=True)
+                print(f"[{logged - t0:4.0f}s] {done} requests done{policy.progress()}", flush=True)
             times = [t for j in self.unsent if (t := self.release.get(j, 0)) > sim.now]
             if timer is not None and timer > sim.now:
                 times.append(timer)
@@ -118,9 +114,12 @@ class OnlineSoldr:
         self.solves = 0
         self.optimal = 0
         self.wall = 0.0
+        # Relative gap between the objective and its bound, of each solve that found a solution
+        self.gaps: list[float] = []
 
     def progress(self) -> str:
-        return f", {self.solves} solves ({self.solves - self.optimal} timed out) in {self.wall:.0f} s"
+        gap = sum(self.gaps) / max(1, len(self.gaps))
+        return f", {self.optimal}/{self.solves} solves optimal, {gap:.0%} avg gap"
 
     # Unsent requests the solver may plan for
     def window(self, loop: Loop) -> list[int]:
@@ -270,6 +269,10 @@ class OnlineSoldr:
         self.optimal += status == cp_model.OPTIMAL
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             return now + 1000
+        if cost := solver.objective_value:
+            self.gaps.append((cost - solver.best_objective_bound) / cost)
+        else:
+            self.gaps.append(0.0)
 
         value = solver.value
         for j in window:
