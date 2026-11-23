@@ -139,12 +139,16 @@ def soldr_ttft(rows: list[Row], recs: list[Rec], prefill_latency: MockerLatency,
 
 # Memory and compute usage of the trace under Mocker's own kv_router decisions
 class MockerUsage:
-    def __init__(self, trace: Trace, num_caches: int, prefill_latency: MockerLatency) -> None:
+    # Of Mocker's own run, unless given the records of another one
+    def __init__(self, trace: Trace, num_caches: int, prefill_latency: MockerLatency,
+                 recs: list[Rec] | None = None) -> None:
         self.trace = trace
         self.num_caches = num_caches
         self.latency = prefill_latency
-        mocker = Mocker(prefill_latency, trace.blk_size)
-        self.recs = mocker.run(mocker.rows(trace.requests), num_caches)
+        if recs is None:
+            mocker = Mocker(prefill_latency, trace.blk_size)
+            recs = mocker.run(mocker.rows(trace.requests), num_caches)
+        self.recs = recs
 
     def peak_working_set(self) -> float:
         reqs = self.trace.requests

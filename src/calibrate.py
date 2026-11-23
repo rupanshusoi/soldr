@@ -49,3 +49,25 @@ def calibrate(path: str, workers: int, config: str) -> None:
     with open(f"params_{config}.json", "w") as f:
         json.dump(asdict(p), f, indent=1)
     print(f"{p} (Mocker mean TTFT {target:.1f} ms)")
+
+
+# decode_ms and c as the online solver meets them in the simulator: the decode step is the mean time between tokens,
+# which includes the passes slowed by a prefill, and c makes the mean prefill match. a and b are left as they are.
+def calibrate_online(config: str) -> None:
+    from online import Config, Online, OnlineSoldr
+    online = Online(Config(params=config))
+    p, reqs = online.p, online.trace.requests
+    recs = online.loop().run(OnlineSoldr(online.cfg))
+    decode_ms = round(sum(q["end"] - q["prefill_end"] for q in recs) / sum(u.osl - 1 for u in reqs))
+    target = sum(q["prefill_end"] - q["start"] for q in recs)
+    lo, hi = 0.0, 1000.0
+    for _ in range(30):
+        p = replace(p, c=(lo + hi) / 2)
+        if sum(p.prefill_ms(u.isl, q["reused"]) for u, q in zip(reqs, recs)) < target:
+            lo = p.c
+        else:
+            hi = p.c
+    p = replace(p, decode_ms=decode_ms, c=round((lo + hi) / 2, 1))
+    with open(f"params_{config}.json", "w") as f:
+        json.dump(asdict(p), f, indent=1)
+    print(p)

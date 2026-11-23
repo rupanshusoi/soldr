@@ -77,7 +77,8 @@ class Plotter:
             row[0].set_ylabel("live state")
             label = row[0].annotate(name, xy=(0, 1), xycoords="axes fraction", xytext=(0, 22),
                                     textcoords="offset points", fontsize=11, fontweight="bold")
-            row[0].annotate(f"{len(miss['eviction'])} eviction "
+            ttft = sum(q["prefill_end"] - q["release"] for q in recs) / self.latency.decode_ms / len(recs)
+            row[0].annotate(f"mean TTFT {ttft:.1f} steps, {len(miss['eviction'])} eviction "
                             f"misses, {len(miss['routing'])} routing misses", xy=(1, 0), xycoords=label, xytext=(8, 0),
                             textcoords="offset points", va="bottom", fontsize=10).set_in_layout(False)
             label.set_in_layout(False)
