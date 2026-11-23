@@ -378,6 +378,14 @@ class Rationer:
             send(j, c, victims)
         return None
 
+# In the unit that suits it
+def duration(ms: float) -> str:
+    if ms < 1000:
+        return f"{ms:.0f} ms"
+    if ms < 60_000:
+        return f"{ms / 1000:.1f} s"
+    return f"{ms / 60_000:.1f} min"
+
 def stats(recs: list[dict[str, Any]], trace: Trace) -> dict[str, float]:
     ttfts = sorted(q["prefill_end"] - q["release"] for q in recs)
     sessions: dict[int, list[dict[str, Any]]] = {}
@@ -450,10 +458,10 @@ class Online:
                 rows[name] = stats(schedules[name], trace)
 
         width = max(map(len, rows))
-        print(f"{'':{width}s} {'TTFT avg/p50/p90 (ms)':>22s} {'reuse':>7s} {'session E2E (s)':>16s}")
+        print(f"{'':{width}s} {'TTFT avg':>9s} {'p50':>9s} {'p90':>9s} {'max':>9s} {'reuse':>7s} {'session E2E (s)':>16s}")
         for name, s in rows.items():
-            ttft = f"{s['mean']:.0f}/{s['p50']:.0f}/{s['p90']:.0f}"
-            print(f"{name:{width}s} {ttft:>22s} {s['reused']:7.1%} {s['session_e2e'] / 1000:16.1f}")
+            ttfts = " ".join(f"{duration(s[k]):>9s}" for k in ["mean", "p50", "p90", "max"])
+            print(f"{name:{width}s} {ttfts} {s['reused']:7.1%} {s['session_e2e'] / 1000:16.1f}")
 
         print("Plotting", flush=True)
         plotter = Plotter(trace, schedules, self.p)
