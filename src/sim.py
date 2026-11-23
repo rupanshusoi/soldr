@@ -147,9 +147,10 @@ class Sim:
             r = w.waiting[0]
             fresh = r.computed == 0 and r.generated == 0
             reused = self.hit(c, r.id) if fresh else 0
-            # vLLM admits a request only if what the running ones hold leaves room for all of its prompt
+            # vLLM admits a request only if what the running ones hold leaves room for all of its prompt, the part
+            # it reuses included: idle KV is free until a request takes it
             held = sum(self.blocks(x.computed) for x in w.running)
-            if self.blocks(r.isl + r.generated) - reused > self.p.kv_capacity - held:
+            if self.blocks(r.isl + r.generated) > self.p.kv_capacity - held:
                 break
             w.waiting.popleft()
             if r.admit is None:

@@ -1,4 +1,5 @@
 import json
+import random
 from dataclasses import dataclass, replace
 from itertools import islice
 
@@ -31,18 +32,15 @@ class Loader:
 
     # Arrival timestamps for Weka are ignored, we use only think_time. Session starts are staggered.
     # Requests of a raw session that share their first block form a sub-session. Sub-sessions are our sessions.
+    # The raw sessions are picked at random, anew on every call unless a seed is given.
     def weka(self, path: str, sessions: int, n: int | None = None, stagger_s: float = 0,
-             idle_cap_s: float = 300) -> Trace:
-        chosen = []
+             idle_cap_s: float = 300, seed: int | None = None) -> Trace:
         with open(path) as f:
-            for line in f:
-                session = json.loads(line)
-                # Ignore sessions with subagents
-                if all(r["type"] != "subagent" for r in session["requests"]):
-                    chosen.append(session)
-                if len(chosen) == sessions:
-                    break
-        assert len(chosen) == sessions, f"only {len(chosen)} sessions without subagents"
+            # Ignore sessions with subagents
+            eligible = [session for session in map(json.loads, f)
+                        if all(r["type"] != "subagent" for r in session["requests"])]
+        assert len(eligible) >= sessions, f"only {len(eligible)} sessions without subagents"
+        chosen = random.Random(seed).sample(eligible, sessions)
         blk_sizes = {p["block_size"] for p in chosen}
         assert len(blk_sizes) == 1
 

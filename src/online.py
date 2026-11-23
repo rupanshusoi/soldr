@@ -399,7 +399,7 @@ class Online:
         self.cfg = cfg
         self.p = MockerLatency.load(cfg.params)
         self.trace = Loader(self.p.decode_ms).weka(cfg.trace, sessions=cfg.sessions, n=cfg.num_requests,
-                                                   stagger_s=cfg.stagger_s)
+                                                   stagger_s=cfg.stagger_s, seed=cfg.seed)
         self.name = "online_" + cfg.name(self.trace)
         self.timing = Timing(self.p)
 
@@ -457,9 +457,9 @@ class Online:
 
         print("Plotting", flush=True)
         plotter = Plotter(trace, schedules, self.p)
-        plotter.swimlane(f"swimlane_{self.name}.png")
-        plotter.cache_lanes(f"caches_{self.name}.png")
-        path = f"{self.name}.json"
+        plotter.swimlane(cfg.out(f"swimlane_{self.name}.png"))
+        plotter.cache_lanes(cfg.out(f"caches_{self.name}.png"))
+        path = cfg.out(f"{self.name}.json")
         with open(path, "w") as f:
             json.dump(dict(params=self.p.config, solves=policy.solves, optimal=policy.optimal, solver_s=policy.wall,
                            stats=rows, schedules=schedules), f, indent=1)
