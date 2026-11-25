@@ -1,4 +1,5 @@
 import json
+from bisect import bisect_right, insort
 import random
 import time
 from dataclasses import dataclass
@@ -302,12 +303,29 @@ class Rationer:
     def progress(self) -> str:
         return ""
 
-    def wake(self, loop: Loop, events: list[Event]) -> None:
-        sim, reqs, p, dt = loop.sim, loop.reqs, loop.p, loop.dt
+    # The three things the Rationer is told about the future. OnlineRationer estimates them instead.
+
+    # Tokens that j generates
+    def out(self, loop: Loop, j: int) -> int:
+        return loop.reqs[j].osl
+
+    # Whether the session of the request that just ended is over
+    def over(self, loop: Loop, j: int) -> bool:
+        return j not in loop.succ
+
+    # (ms its session is still away, ms to rebuild it) of the idle cache that request k left
+    def away(self, loop: Loop, k: int) -> tuple[float, float]:
+        v = loop.succ[k]
+        return (max(0.0, loop.release[v] - loop.sim.now),
+                saving(loop.reqs[k], loop.reqs[v], loop.sim.blk_size, loop.p) * loop.dt)
+
+    def wake(self, loop: Loop, events: list[Event]) -> float | None:
+        sim, reqs, p = loop.sim, loop.reqs, loop.p
         now, C = sim.now, len(sim.workers)
-        size = lambda j: sim.blocks(reqs[j].isl + reqs[j].osl)
+        size = lambda j: sim.blocks(reqs[j].isl + self.out(loop, j))
+        away = lambda k: self.away(loop, k)
         for e in events:
-            if e.kind == "end" and e.id not in loop.succ:
+            if e.kind == "end" and self.over(loop, e.id):
                 sim.evict(e.worker, sim.session[e.id])
         waiting = loop.waiting()
         if not waiting:
@@ -317,11 +335,6 @@ class Rationer:
                        for r in [*w.running, *w.waiting] if r.first_token is None) for c, w in enumerate(sim.workers)]
         free = [p.kv_capacity - sum(size(r.id) for r in [*w.running, *w.waiting]) - sum(e.tokens for e in w.idle.values())
                 for w in sim.workers]
-
-        # (ms its session is still away, ms to rebuild it) of an idle cache
-        def away(k: int) -> tuple[float, float]:
-            v = loop.succ[k]
-            return max(0.0, loop.release[v] - now), saving(reqs[k], reqs[v], sim.blk_size, p) * dt
 
         # Cheapest way to run j on c: (ms to its first token, sessions whose caches to drop), if it can be made to fit
         def option(j: int, c: int) -> tuple[float, list[int]] | None:
@@ -377,6 +390,60 @@ class Rationer:
                 victims.append(s)
             send(j, c, victims)
         return None
+
+# The Rationer without its foresight. It sees a request when it is released, and an output length when the request
+# ends. What it was told it now estimates from what the run has shown it so far.
+class OnlineRationer(Rationer):
+    def __init__(self, patience: float = 1, aging: float = 0, quantile: float = 0.5, out_quantile: float = 0.9) -> None:
+        super().__init__(patience, aging)
+        # A session is taken to stay away for this quantile of the gaps seen that outlasted its own so far
+        self.quantile = quantile
+        # A request is given room for this quantile of the output lengths seen
+        self.out_quantile = out_quantile
+        # Sorted: ms between the end of a request and the release of the next of its session, output lengths
+        self.gaps: list[float] = []
+        self.outs: list[int] = []
+        self.seen: set[int] = set()
+
+    def out(self, loop: Loop, j: int) -> int:
+        guess = self.outs[int(self.out_quantile * (len(self.outs) - 1))] if self.outs else 1000
+        # A request that has outgrown the guess is given a block more
+        return max(guess, self.generated.get(j, 0) + loop.p.kv_block)
+
+    # A session may always come back
+    def over(self, loop: Loop, j: int) -> bool:
+        return False
+
+    def away(self, loop: Loop, k: int) -> tuple[float, float]:
+        sim = loop.sim
+        # The next request is taken to reuse all of the cache
+        tokens = loop.reqs[k].isl + loop.reqs[k].osl
+        rebuild = loop.p.prefill_ms(tokens)
+        v = loop.succ.get(k)
+        if v is not None and v in self.seen:
+            return 0.0, rebuild
+        gone = sim.now - sim.recs[k]["end"]
+        # Gaps that lasted longer than this one has. The longer a session has been away, the longer it stays away.
+        tail = self.gaps[bisect_right(self.gaps, gone):]
+        if len(tail) < 5:
+            # Away for longer than nearly any session that came back
+            return (float("inf") if len(self.gaps) >= 20 else gone), rebuild
+        return tail[int(self.quantile * (len(tail) - 1))] - gone, rebuild
+
+    def wake(self, loop: Loop, events: list[Event]) -> float | None:
+        sim, reqs = loop.sim, loop.reqs
+        for e in events:
+            if e.kind == "end":
+                insort(self.outs, reqs[e.id].osl)
+        for j in loop.waiting():
+            if j not in self.seen:
+                self.seen.add(j)
+                if (k := reqs[j].prev) is not None:
+                    insort(self.gaps, loop.release[j] - sim.recs[k]["end"])
+        self.generated = {r.id: r.generated for w in sim.workers for r in [*w.running, *w.waiting]}
+        super().wake(loop, events)
+        # A cache in the way gets easier to drop as its session stays away
+        return sim.now + 1000 if loop.waiting() else None
 
 # In the unit that suits it
 def duration(ms: float) -> str:
@@ -436,6 +503,8 @@ class Online:
         rows["Online Soldr"] = stats(schedules["Online Soldr"], trace)
         schedules["Rationer"] = self.loop().run(Rationer())
         rows["Rationer"] = stats(schedules["Rationer"], trace)
+        schedules["Rationer (online)"] = self.loop().run(OnlineRationer())
+        rows["Rationer (online)"] = stats(schedules["Rationer (online)"], trace)
 
         # The best run by mean TTFT is the one reported and plotted
         best = lambda runs: min(runs, key=lambda recs: stats(recs, trace)["mean"])
