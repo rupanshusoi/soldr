@@ -1,7 +1,10 @@
+import glob
 import json
+import os
 import random
 from dataclasses import dataclass, replace
 from itertools import islice
+from typing import Any
 
 @dataclass
 class Request:
@@ -74,11 +77,83 @@ class Loader:
                 last[sub] = (len(trace) - 1, t)
             offset += 1 + max(h for r in session["requests"] for h in r["hash_ids"])
 
+        return self.first(trace, est, n, blk_sizes.pop())
+
+    # The first n requests by est, which estimates when each is released
+    def first(self, trace: list[Request], est: list[float], n: int | None, blk_size: int) -> Trace:
         assert n is None or len(trace) >= n
         order = sorted(range(len(trace)), key=lambda i: est[i])[:n]
         pos = {i: k for k, i in enumerate(order)}
         prev_of = lambda u: None if u.prev is None else pos[u.prev]
-        return Trace([replace(trace[i], prev=prev_of(trace[i])) for i in order], blk_sizes.pop())
+        return Trace([replace(trace[i], prev=prev_of(trace[i])) for i in order], blk_size)
+
+    # The FreeInference agentic trace of Harvard MadSys, at the root of its release. As for Weka: recorded arrivals
+    # are ignored, session starts are staggered, think times are capped and the sessions are picked at random. A
+    # session is all the requests of a recorded session in order. Sessions with subagents are left out, and so are
+    # those with a prompt over max_isl tokens, which the trace has up to 1.8M of.
+    # The trace gives the prefix of a prompt in blocks of 16 tokens with ids that sessions share. We join them into
+    # blocks of blk_size and keep the ids of sessions apart, as for Weka, so a session only reuses its own KV.
+    def freeinference(self, path: str, sessions: int, n: int | None = None, stagger_s: float = 0,
+                      idle_cap_s: float = 300, seed: int | None = None, max_isl: int = 256_000,
+                      blk_size: int = 64) -> Trace:
+        import pyarrow.parquet as pq  # type: ignore[import-untyped]
+        weeks = sorted(glob.glob(os.path.join(path, "release", "*", "processed")))
+        assert weeks, f"no FreeInference release under {path}"
+        week_of: dict[str, str] = {}
+        excluded: set[str] = set()
+        for week in weeks:
+            with open(os.path.join(week, "..", "manifest.json")) as f:
+                per_blk = blk_size // json.load(f)["block_tokens"]
+            for s in pq.read_table(os.path.join(week, "sessions.parquet")).to_pylist():
+                week_of[s["session_id"]] = week
+                # Subagents and the sessions that spawned them
+                if s["parent_session_id"] is not None:
+                    excluded |= {s["session_id"], s["parent_session_id"]}
+            columns = ["session_id", "prompt_tokens", "waited_for"]
+            for r in pq.read_table(os.path.join(week, "requests.parquet"), columns=columns).to_pylist():
+                if r["waited_for"] == "subagent" or r["prompt_tokens"] > max_isl:
+                    excluded.add(r["session_id"])
+        eligible = sorted(week_of.keys() - excluded)
+        assert len(eligible) >= sessions, f"only {len(eligible)} sessions without subagents"
+        chosen = random.Random(seed).sample(eligible, sessions)
+
+        rows: dict[str, list[dict[str, Any]]] = {s: [] for s in chosen}
+        columns = ["session_id", "step", "start_ms", "end_ms", "completion_tokens", "block_ids"]
+        for week in sorted({week_of[s] for s in chosen}):
+            ids = [s for s in chosen if week_of[s] == week]
+            table = pq.read_table(os.path.join(week, "requests.parquet"), columns=columns,
+                                  filters=[("session_id", "in", ids)])
+            for r in table.to_pylist():
+                rows[r["session_id"]].append(r)
+
+        trace: list[Request] = []
+        est: list[float] = []
+        # Id of each block of blk_size tokens, by the ids the trace gives its parts
+        block: dict[tuple[int, tuple[int, ...]], int] = {}
+        for s, session in enumerate(chosen):
+            t = s * stagger_s
+            prev = None
+            for k, r in enumerate(sorted(rows[session], key=lambda r: r["step"])):
+                parts = r["block_ids"]
+                # The partial last block is dropped, as the trace does
+                hash_ids = [block.setdefault((s, tuple(parts[i:i + per_blk])), len(block))
+                            for i in range(0, max(per_blk, len(parts) - len(parts) % per_blk), per_blk)]
+                think = 0.0 if prev is None else min(max(0, r["start_ms"] - prev["end_ms"]) / 1000, idle_cap_s)
+                t += think
+                est.append(t)
+                arrival = round(t * 1000) // self.ms_per_step if prev is None else None
+                trace.append(Request(len(hash_ids) * blk_size, max(1, r["completion_tokens"]), arrival, hash_ids,
+                                     None if prev is None else len(trace) - 1,
+                                     round(think * 1000) // self.ms_per_step))
+                t += (r["end_ms"] - r["start_ms"]) / 1000
+                prev = r
+        return self.first(trace, est, n, blk_size)
+
+    # By where the trace is: FreeInference is a directory, Weka a file
+    def load(self, path: str, sessions: int, n: int | None = None, stagger_s: float = 0,
+             seed: int | None = None) -> Trace:
+        loader = self.freeinference if os.path.isdir(path) else self.weka
+        return loader(path, sessions, n=n, stagger_s=stagger_s, seed=seed)
 
 def shared_tokens(u: Request, v: Request, blk_size: int) -> int:
     count = 0

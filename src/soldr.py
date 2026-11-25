@@ -79,7 +79,7 @@ class Soldr:
         self.cfg = cfg
         self.latency = MockerLatency.load(cfg.params)
         loader = Loader(self.latency.decode_ms)
-        self.trace = loader.weka(cfg.trace, sessions=cfg.sessions, n=cfg.num_requests, stagger_s=cfg.stagger_s,
+        self.trace = loader.load(cfg.trace, sessions=cfg.sessions, n=cfg.num_requests, stagger_s=cfg.stagger_s,
                                  seed=cfg.seed)
         self.name = cfg.name(self.trace)
         self.mocker = Mocker(self.latency, self.trace.blk_size)

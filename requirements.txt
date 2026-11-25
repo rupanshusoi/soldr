@@ -22,3 +22,5 @@ numpy
 matplotlib
 pytest
 mypy
+# Reads the FreeInference trace
+pyarrow==26.0.0

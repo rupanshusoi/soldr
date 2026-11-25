@@ -473,7 +473,7 @@ class Online:
         assert cfg.objective == "mean"
         self.cfg = cfg
         self.p = MockerLatency.load(cfg.params)
-        self.trace = Loader(self.p.decode_ms).weka(cfg.trace, sessions=cfg.sessions, n=cfg.num_requests,
+        self.trace = Loader(self.p.decode_ms).load(cfg.trace, sessions=cfg.sessions, n=cfg.num_requests,
                                                    stagger_s=cfg.stagger_s, seed=cfg.seed)
         self.name = "online_" + cfg.name(self.trace)
         self.timing = Timing(self.p)
