@@ -5,8 +5,9 @@ from dataclasses import dataclass, field
 from math import ceil
 from typing import Any, TypedDict
 from ortools.sat.python import cp_model
-from mocker import Mocker, MockerLatency, MockerUsage, Objective, soldr_ttft, summarize
+from mocker import MockerLatency, Objective, Usage, soldr_ttft, summarize
 from plot import Plotter, Schedules
+from sim import Event, KvRouter, Loop, Timing
 from workload import Loader, Request, Trace, shared_tokens
 
 Expr = cp_model.LinearExpr | int
@@ -18,7 +19,7 @@ class Config:
     num_caches: int = 4
     sessions_per_cache: int = 5
     # All requests if None
-    num_requests: int | None = None
+    num_requests: int | None = 64
     stagger_s: float = 5
     objective: Objective = "mean"
     horizon: int = 500_000
@@ -74,6 +75,33 @@ class Solution:
     def found(self) -> bool:
         return self.status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
 
+# Carries out a schedule of Soldr in the simulator, closed-loop: a request goes to the worker the schedule routes it to,
+# as long after its release as the schedule holds it, and a session cache is dropped when its request ends unless the
+# schedule keeps it. Releases are the simulator's own, since its requests do not end when the schedule's do.
+@dataclass
+class Replay:
+    route: list[int]
+    # ms from the release of each request to its start
+    wait: list[float]
+    # Whether the session cache each request leaves is hit by its successor
+    kept: list[bool]
+
+    def progress(self) -> str:
+        return ""
+
+    def wake(self, loop: Loop, events: list[Event]) -> float | None:
+        sim = loop.sim
+        for e in events:
+            if e.kind == "end" and not self.kept[e.id]:
+                sim.evict(e.worker, sim.session[e.id])
+        held = []
+        for j in loop.waiting():
+            if (t := loop.release[j] + self.wait[j]) > sim.now:
+                held.append(t)
+            else:
+                loop.send(j, self.route[j])
+        return min(held, default=None)
+
 class Soldr:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -82,7 +110,7 @@ class Soldr:
         self.trace = loader.load(cfg.trace, sessions=cfg.sessions, n=cfg.num_requests, stagger_s=cfg.stagger_s,
                                  seed=cfg.seed)
         self.name = cfg.name(self.trace)
-        self.mocker = Mocker(self.latency, self.trace.blk_size)
+        self.timing = Timing(self.latency)
 
     def log_stats(self) -> None:
         cfg, reqs = self.cfg, self.trace.requests
@@ -92,7 +120,9 @@ class Soldr:
         print("Total sessions: ", total_sessions)
         print(f"Avg session length: {len(reqs) / total_sessions:.1f} requests")
         print(f"Session stagger: {cfg.stagger_s} s")
-        usage = MockerUsage(self.trace, cfg.num_caches, self.latency)
+        # Of the default KV router in the simulator
+        usage = Usage(self.trace, cfg.num_caches, self.latency,
+                      Loop(self.trace, self.latency, cfg.num_caches, self.timing).run(KvRouter(0)))
         usage.peak_working_set()
         usage.compute_usage()
 
@@ -221,50 +251,40 @@ class Soldr:
                 print(f"Gap: {(obj - bound) / max(abs(obj), 1):.1%}")
         return sol
 
-    # Replays Soldr's schedule and Dynamo's own in the Mocker
-    def compare(self, sol: Solution, mocker_runs: int = 5) -> Schedules:
-        solver, vars, mocker, objective = sol.solver, sol.vars, self.mocker, self.cfg.objective
-        reqs, dt = self.trace.requests, self.latency.decode_ms
-        rows = mocker.rows(reqs, sessions=False)
-        route = [next(c for c, r in enumerate(rs) if solver.Value(r)) for rs in vars["routes"]]
-        submit = [solver.Value(s) * dt for s in vars["starts"]]
-        release = [solver.Value(r) * dt for r in vars["releases"]]
-        soldr_mocker = [0.0] * len(rows)
-        # Soldr's schedule as Mocker replays it. Mocker's clock starts at each worker's first submission.
-        soldr: list[dict[str, Any]] = [{} for _ in rows]
-        for c in set(route):
-            ix = sorted((j for j in range(len(rows)) if route[j] == c), key=lambda j: (submit[j], j))
-            for j, q in zip(ix, mocker.run([rows[j] | {"timestamp": submit[j]} for j in ix], 1)):
-                soldr_mocker[j] = submit[j] - release[j] + q["ttft_ms"]
-                t0 = submit[j] - q["arrival_time_ms"]
-                soldr[j] = dict(worker=c, release=release[j], start=t0 + q["first_admit_ms"],
-                                prefill_end=t0 + q["first_token_ms"], end=t0 + q["terminal_time_ms"],
-                                reused=q["reused_input_tokens"])
-        schedules = {"Soldr": soldr}
+    # Replays Soldr's schedule and Dynamo's KV router in the simulator
+    def compare(self, sol: Solution, router_runs: int = 5) -> Schedules:
+        value, vars, objective = sol.solver.Value, sol.vars, self.cfg.objective
+        reqs, dt, C = self.trace.requests, self.latency.decode_ms, self.cfg.num_caches
+        succ = {v.prev: j for j, v in enumerate(reqs) if v.prev is not None}
+        schedules = {"Soldr": Loop(self.trace, self.latency, C, self.timing).run(Replay(
+            route=[next(c for c, r in enumerate(rs) if value(r)) for rs in vars["routes"]],
+            wait=[(value(s) - value(r)) * dt for s, r in zip(vars["starts"], vars["releases"])],
+            kept=[j in succ and bool(value(vars["hits"][succ[j]])) for j in range(len(reqs))]))}
 
-        rows = mocker.rows(reqs)
-
-        score = lambda recs: (soldr_ttft(rows, recs, self.latency, objective),
-                              summarize([q["ttft_ms"] / dt for q in recs], objective))
-        from dynamo._core import KvRouterConfig
-        # The best of mocker_runs replays by Mocker score, which is also the one plotted
-        def dynamo(name: str, **kwargs: Any) -> tuple[str, float, float]:
-            recs = [mocker.run(rows, self.cfg.num_caches, **kwargs) for _ in range(mocker_runs)]
-            scores = [score(r) for r in recs]
-            best = min(range(mocker_runs), key=lambda k: scores[k][1])
-            name = f"{name}, best of {mocker_runs}"
-            schedules[name] = [dict(worker=q["decode_worker_idx"], release=q["arrival_time_ms"],
-                                    start=q["first_admit_ms"], prefill_end=q["first_token_ms"],
-                                    end=q["terminal_time_ms"], reused=q["reused_input_tokens"]) for q in recs[best]]
+        # (the simulator's decisions in Soldr's cost model, the simulator's own TTFT), both in timesteps
+        def score(recs: list[dict[str, Any]]) -> tuple[float, float]:
+            rows = [{"input_length": u.isl} for u in reqs]
+            sent = [dict(arrival_time_ms=q["release"], decode_worker_idx=q["worker"], reused_input_tokens=q["reused"])
+                    for q in recs]
+            return (soldr_ttft(rows, sent, self.latency, objective),
+                    summarize([(q["prefill_end"] - q["release"]) / dt for q in recs], objective))
+        # KV router tie breaks are random. The best of router_runs seeds by simulated score is also the one plotted.
+        def dynamo(name: str, track_active_blocks: bool) -> tuple[str, float, float]:
+            runs = [Loop(self.trace, self.latency, C, self.timing).run(KvRouter(seed, track_active_blocks))
+                    for seed in range(router_runs)]
+            scores = [score(recs) for recs in runs]
+            best = min(range(router_runs), key=lambda k: scores[k][1])
+            name = f"{name}, best of {router_runs}"
+            schedules[name] = runs[best]
             return name, *scores[best]
-        soldr_soldr = summarize([solver.Value(t) for t in vars["ttfts"]], objective)
-        table = [("Soldr", soldr_soldr, summarize([t / dt for t in soldr_mocker], objective)),
-                 dynamo("Dynamo"),
-                 dynamo("Dynamo (w/o active tracking)", router_config=KvRouterConfig(router_track_active_blocks=False))]
+        soldr_soldr = summarize([value(t) for t in vars["ttfts"]], objective)
+        table = [("Soldr", soldr_soldr, score(schedules["Soldr"])[1]),
+                 dynamo("Dynamo", True),
+                 dynamo("Dynamo (w/o active tracking)", False)]
         label = "Avg TTFT" if objective == "mean" else f"P{objective * 100:g} TTFT"
-        print(f"{label:40s} {'Soldr':>7s} {'Mocker':>7s}")
-        for name, model_ttft, mocker_ttft in table:
-            print(f"{name:40s} {model_ttft:7.1f} {mocker_ttft:7.1f}")
+        print(f"{label:40s} {'Soldr':>7s} {'Sim':>7s}")
+        for name, model_ttft, sim_ttft in table:
+            print(f"{name:40s} {model_ttft:7.1f} {sim_ttft:7.1f}")
         return schedules
 
     def visualize(self, schedules: Schedules) -> None:

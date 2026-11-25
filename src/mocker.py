@@ -14,7 +14,7 @@ os.environ.setdefault("DYN_LOG", "warn")
 Objective = Literal["mean"] | float
 # A trace row as fed to Mocker
 Row = dict[str, Any]
-# Mocker's record of a request
+# A record of a request, Mocker's or the simulator's
 Rec = dict[str, Any]
 
 
@@ -99,11 +99,11 @@ class Mocker:
         t0 = rows[0]["timestamp"]
         return [recs[key(r["timestamp"] - t0, r["input_length"], r["output_length"])].pop() for r in rows]
 
-    def rows(self, reqs: list[Request], sessions: bool = True) -> list[Row]:
+    def rows(self, reqs: list[Request]) -> list[Row]:
         dt = self.latency.decode_ms
         rows: list[Row] = [{"timestamp": (u.arrival or 0) * dt, "input_length": u.isl, "output_length": u.osl,
                             "hash_ids": u.hash_ids} for u in reqs]
-        if not sessions or all(u.prev is None for u in reqs):
+        if all(u.prev is None for u in reqs):
             return rows
 
         session = sessions_of(reqs)
@@ -137,17 +137,12 @@ def soldr_ttft(rows: list[Row], recs: list[Rec], prefill_latency: MockerLatency,
     return summarize(ttfts, objective)
 
 
-# Memory and compute usage of the trace under Mocker's own kv_router decisions
-class MockerUsage:
-    # Of Mocker's own run, unless given the records of another one
-    def __init__(self, trace: Trace, num_caches: int, prefill_latency: MockerLatency,
-                 recs: list[Rec] | None = None) -> None:
+# Memory and compute usage of the trace in a run of the simulator, given its records
+class Usage:
+    def __init__(self, trace: Trace, num_caches: int, prefill_latency: MockerLatency, recs: list[Rec]) -> None:
         self.trace = trace
         self.num_caches = num_caches
         self.latency = prefill_latency
-        if recs is None:
-            mocker = Mocker(prefill_latency, trace.blk_size)
-            recs = mocker.run(mocker.rows(trace.requests), num_caches)
         self.recs = recs
 
     def peak_working_set(self) -> float:
@@ -161,9 +156,9 @@ class MockerUsage:
         events = []
         for j, (u, q) in enumerate(zip(reqs, self.recs)):
             held = 0 if u.prev is None else reqs[u.prev].isl + reqs[u.prev].osl
-            events.append((q["arrival_time_ms"], u.isl + u.osl - held))
+            events.append((q["release"], u.isl + u.osl - held))
             if j in last:
-                events.append((q["terminal_time_ms"], -(u.isl + u.osl)))
+                events.append((q["end"], -(u.isl + u.osl)))
 
         live = peak = 0
         for _, delta in sorted(events):
@@ -183,9 +178,9 @@ class MockerUsage:
 
     def compute_usage(self) -> tuple[float, float]:
         recs, C = self.recs, self.num_caches
-        duration = max(q["terminal_time_ms"] for q in recs) - min(q["arrival_time_ms"] for q in recs)
-        on = lambda c, end: self.covered((q["first_admit_ms"], q[end]) for q in recs if q["decode_worker_idx"] == c)
-        busy = sum(on(c, "terminal_time_ms") for c in range(C)) / (C * duration)
-        prefill = sum(on(c, "first_token_ms") for c in range(C)) / (C * duration)
+        duration = max(q["end"] for q in recs) - min(q["release"] for q in recs)
+        on = lambda c, end: self.covered((q["start"], q[end]) for q in recs if q["worker"] == c)
+        busy = sum(on(c, "end") for c in range(C)) / (C * duration)
+        prefill = sum(on(c, "prefill_end") for c in range(C)) / (C * duration)
         print(f"Avg compute usage: {busy:.1%} ({prefill:.1%} prefill, {busy - prefill:.1%} decode only)")
         return busy, prefill

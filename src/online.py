@@ -1,15 +1,14 @@
 import json
 from bisect import bisect_right, insort
-import random
 import time
 from dataclasses import dataclass
 from math import ceil
-from typing import Any, Protocol
+from typing import Any
 from ortools.sat.python import cp_model
 import soldr
-from mocker import Mocker, MockerLatency, MockerUsage
+from mocker import Mocker, MockerLatency, Usage
 from plot import Plotter, Schedules
-from sim import Event, Live, Sim, Timing
+from sim import Event, KvRouter, Live, Loop, Timing
 from soldr import Expr, saving
 from workload import Loader, Trace, sessions_of
 
@@ -29,83 +28,6 @@ class Config(soldr.Config):
     log_s: float = 5
     # Also replays both KV routers in Mocker this many times, to check the simulator
     mocker_runs: int = 0
-
-class Policy(Protocol):
-    # Called whenever something happened. Returns when to be called again at the latest.
-    def wake(self, loop: "Loop", events: list[Event]) -> float | None: ...
-    # For the progress log
-    def progress(self) -> str: ...
-
-# Sends a trace through the simulator closed-loop, with a policy that decides where and when each request runs
-class Loop:
-    def __init__(self, trace: Trace, p: MockerLatency, workers: int, timing: Timing) -> None:
-        self.reqs, self.p, self.dt = trace.requests, p, p.decode_ms
-        self.sim = Sim(trace, p, workers, timing)
-        self.succ = {u.prev: j for j, u in enumerate(self.reqs) if u.prev is not None}
-        # In ms. Turns after the first are released when their predecessor ends.
-        self.release = {j: float(u.arrival * self.dt) for j, u in enumerate(self.reqs) if u.arrival is not None}
-        self.unsent = set(range(len(self.reqs)))
-
-    # Released requests that are yet to be sent, oldest first
-    def waiting(self) -> list[int]:
-        now = self.sim.now
-        return sorted((j for j in self.unsent if self.release.get(j, now + 1) <= now), key=lambda j: (self.release[j], j))
-
-    def send(self, j: int, c: int) -> None:
-        self.unsent.remove(j)
-        self.sim.submit(j, c, self.release[j])
-
-    # Prints a progress line every log_s seconds if given
-    def run(self, policy: Policy, log_s: float | None = None) -> list[dict[str, Any]]:
-        sim, done = self.sim, 0
-        t0 = logged = time.time()
-        timer = policy.wake(self, [])
-        while done < len(self.reqs):
-            if log_s is not None and time.time() - logged >= log_s:
-                logged = time.time()
-                print(f"[{logged - t0:4.0f}s] {done} requests done{policy.progress()}", flush=True)
-            times = [t for j in self.unsent if (t := self.release.get(j, 0)) > sim.now]
-            if timer is not None and timer > sim.now:
-                times.append(timer)
-            until = min(times, default=float("inf"))
-            events = sim.step(until)
-            assert events or until < float("inf"), "nothing is running and nothing is due"
-            for e in events:
-                if e.kind == "end":
-                    done += 1
-                    if (v := self.succ.get(e.id)) is not None:
-                        self.release[v] = sim.now + self.reqs[v].think * self.dt
-            timer = policy.wake(self, events)
-        return [sim.recs[j] for j in range(len(self.reqs))]
-
-# Dynamo's KV router with its default config: the cost of a worker is the prefill it would have queued, less what the
-# request finds cached there, plus the KV of its active requests, all in blocks. Freed KV is left to the worker's LRU.
-# track_active_blocks is the router_track_active_blocks flag: without it the KV of active requests costs nothing.
-class KvRouter:
-    def __init__(self, seed: int, track_active_blocks: bool = True) -> None:
-        self.rng = random.Random(seed)
-        self.track_active_blocks = track_active_blocks
-        # New tokens of each request that is yet to give its first token, as estimated when it was routed
-        self.prefill: dict[int, int] = {}
-
-    def progress(self) -> str:
-        return ""
-
-    def wake(self, loop: Loop, events: list[Event]) -> None:
-        sim, blk = loop.sim, loop.sim.blk_size
-        for e in events:
-            if e.kind == "first_token":
-                del self.prefill[e.id]
-        for j in loop.waiting():
-            isl, costs = loop.reqs[j].isl, []
-            for c, w in enumerate(sim.workers):
-                active = [*w.running, *w.waiting]
-                queued = sum(self.prefill.get(r.id, 0) for r in active)
-                decode = sum(ceil(r.isl / blk) for r in active) if self.track_active_blocks else 0
-                costs.append(max(0, (queued + isl) / blk - sim.hit(c, j) // blk) + decode)
-            c = self.rng.choice([c for c, cost in enumerate(costs) if cost == min(costs)])
-            self.prefill[j] = isl - sim.hit(c, j)
-            loop.send(j, c)
 
 # Soldr's model over what is in flight and the requests in sight, solved again at every wake. Only what the solution
 # does right now is carried out: the requests it starts at time 0 and the session caches it drops.
@@ -489,10 +411,8 @@ class Online:
         print(f"Avg session length: {len(trace.requests) / total_sessions:.1f} requests")
         print(f"Session stagger: {cfg.stagger_s} s")
         print("Caches: ", cfg.num_caches)
-        # As soldr prints for Mocker's run, here of the default KV router in the simulator
-        usage = MockerUsage(trace, cfg.num_caches, self.p, [dict(
-            arrival_time_ms=q["release"], first_admit_ms=q["start"], first_token_ms=q["prefill_end"],
-            terminal_time_ms=q["end"], decode_worker_idx=q["worker"]) for q in self.loop().run(KvRouter(0))])
+        # Of the default KV router in the simulator
+        usage = Usage(trace, cfg.num_caches, self.p, self.loop().run(KvRouter(0)))
         usage.peak_working_set()
         usage.compute_usage()
         schedules: Schedules = {}
