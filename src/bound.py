@@ -49,6 +49,9 @@ class Schedule:
     end: float
     # Use of each resource in each piece, in cache-steps
     usage: Array
+    # Step at which each turn starts, and whether it reuses the session's KV
+    starts: list[float]
+    hits: list[bool]
 
 class Bound:
     def __init__(self, trace: Trace, p: MockerLatency, caches: int, mem: int | None = None, grid: int = 25,
@@ -70,6 +73,8 @@ class Bound:
                 assert think is not None
                 turns.append(Turn(p(u.isl) - save, p(u.isl), u.osl, think, u.isl + u.osl))
             self.sessions.append(turns)
+        # Requests of each session, in order
+        self.chains = list(chains.values())
         # Sum of TTFTs is the sum over sessions of the end of the last turn, less this
         self.fixed = sum(t.osl + t.think for turns in self.sessions for t in turns)
 
@@ -207,9 +212,12 @@ class Bound:
         prefill[-1] = 1
         at = int(arg_miss[cell]) if cell < N else N
         hit, x = False, float(turns[0].think)
+        starts, hits = list[float](), list[bool]()
         for k, t in enumerate(turns):
             if at < N:
                 x = float(at * g)
+            starts.append(x)
+            hits.append(hit)
             pre = t.hit if hit else t.miss
             use(prefill, x, x + pre)
             use(np.append(weights[k], 0), x, x + pre + t.osl)
@@ -224,7 +232,7 @@ class Bound:
                 x = max(release, float(at * g)) if at < N else release
                 if hit:
                     use(np.append(weights[k], 0), end, x)
-        return value, Schedule(end, usage)
+        return value, Schedule(end, usage, starts, hits)
 
     def run(self, iterations: int = 200, tol: float = 0.01, smooth: float = 0.5, cap: float = 1000,
             log: bool = True) -> float:
